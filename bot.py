@@ -6,6 +6,7 @@ import threading
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask
 from instagrapi import Client
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
@@ -24,6 +25,7 @@ IG_USER = _env_required("IG_USER")
 IG_PASS = _env_required("IG_PASS")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 SESSION_FILE = os.path.join(DOWNLOAD_DIR, "ig_session.json")
+HTTP_PORT = int(os.environ.get("PORT", "8000"))
 
 two_factor_code = None
 ig_lock = threading.Lock()
@@ -34,6 +36,12 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 
 cl = Client()
+web = Flask(__name__)
+
+
+@web.route("/health")
+def health():
+    return {"status": "ok"}, 200
 
 # Charger une session existante pour éviter de redemander le 2FA à chaque fois
 def load_instagram_session():
@@ -207,7 +215,14 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Si Instagram demande un code 2FA, utilise /code 123456."
     )
 
+def start_web_server():
+    web.run(host="0.0.0.0", port=HTTP_PORT, use_reloader=False)
+
+
 if __name__ == '__main__':
+    # Lancer le petit serveur Flask pour UptimeRobot/Render keep-alive
+    threading.Thread(target=start_web_server, daemon=True).start()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", handle_start))
