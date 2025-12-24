@@ -206,7 +206,9 @@ def post_story_job(file_id: str, chat_id: int, bot, job_id: str) -> None:
             except Exception as e:
                 logging.warning("Impossible de supprimer le fichier temporaire: %s", e)
 
-# --- GESTION TELEGRAM ---async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+# --- GESTION TELEGRAM ---
+async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestionnaire de la commande /list - Affiche les publications programmées."""
     user_jobs = [
         (job_id, info) for job_id, info in scheduled_jobs.items()
