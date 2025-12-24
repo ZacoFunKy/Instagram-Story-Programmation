@@ -19,6 +19,14 @@ from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from db_manager import DBManager
+from datetime_manager import (
+    parse_datetime,
+    get_quick_time_keyboard,
+    process_quick_time_callback,
+    validate_scheduled_time,
+    create_confirmation_message,
+    get_datetime_help_text
+)
 
 # Charger les variables d'environnement depuis .env (pour développement local)
 load_dotenv()
@@ -111,44 +119,6 @@ def save_instagram_session() -> None:
         logging.info("Session Instagram sauvegardée")
     except Exception as exc:
         logging.warning("Sauvegarde de la session Instagram impossible: %s", exc)
-
-
-def parse_run_date(text: str, now: datetime) -> tuple[datetime | None, bool]:
-    """
-    Parse l'heure ou la date/heure fournie par l'utilisateur.
-    
-    Args:
-        text: Chaîne au format HH:MM, JJ/MM HH:MM, JJ/MM/AAAA HH:MM ou AAAA-MM-JJ HH:MM
-        now: Datetime actuelle avec timezone pour référence
-    
-    Returns:
-        Tuple (datetime parsée ou None, booléen indiquant si date explicite)
-    """
-    text = text.strip()
-    formats_with_date = [
-        ("%Y-%m-%d %H:%M", True),
-        ("%d/%m/%Y %H:%M", True),
-        ("%d/%m %H:%M", True),
-    ]
-
-    for fmt, explicit_date in formats_with_date:
-        try:
-            dt = datetime.strptime(text, fmt)
-            if fmt == "%d/%m %H:%M":
-                dt = dt.replace(year=now.year)
-            # Ajouter la timezone configurée
-            dt = dt.replace(tzinfo=TIMEZONE)
-            return dt, explicit_date
-        except ValueError:
-            pass
-
-    try:
-        t = datetime.strptime(text, "%H:%M").time()
-        # Combiner avec la date actuelle puis appliquer la timezone
-        dt = datetime.combine(now.date(), t).replace(tzinfo=TIMEZONE)
-        return dt, False
-    except ValueError:
-        return None, False
 
 
 def instagram_login(
@@ -649,30 +619,43 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     time_str = update.message.text.strip()
     file_id = context.user_data.get('current_media_file_id')
     media_type = context.user_data.get('current_media_type', 'photo')
+    to_close_friends = context.user_data.get('to_close_friends', False)
 
     if not file_id:
-        await update.message.reply_text("❌ Envoie d'abord une photo ou vidéo !")
-        return
-
-    now = now_tz()
-    run_date, explicit_date = parse_run_date(time_str, now)
-    if not run_date:
         await update.message.reply_text(
-            "Format invalide. Utilise HH:MM (ex: 14:05) ou une date+heure (ex: 25/12 09:30)."
+            "❌ *Aucun média en attente*\n\n"
+            "Envoie d'abord une photo ou vidéo pour commencer.",
+            parse_mode="Markdown"
         )
         return
 
-    if run_date <= now:
-        if explicit_date:
-            await update.message.reply_text("⚠️ Cette date est déjà passée. Donne une date future.")
-            return
-        run_date += timedelta(days=1)
-        day_info = " (demain)"
-    else:
-        day_info = ""
+    now = now_tz()
+    
+    # Parser avec le nouveau module professionnel
+    run_date, explicit_date, format_used = parse_datetime(time_str, now, TIMEZONE)
+    
+    if not run_date:
+        keyboard = get_quick_time_keyboard()
+        await update.message.reply_text(
+            "❌ *Format non reconnu*\n\n"
+            f"{get_datetime_help_text()}",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Valider la date programmée
+    is_valid, error_message = validate_scheduled_time(run_date, now)
+    if not is_valid:
+        await update.message.reply_text(
+            f"{error_message}\n\n"
+            "💡 Astuce : Utilise les boutons rapides !",
+            parse_mode="Markdown",
+            reply_markup=get_quick_time_keyboard()
+        )
+        return
 
     # Créer la story dans la base de données
-    to_close_friends = context.user_data.get('to_close_friends', False)
     story = db.create_story(
         chat_id=update.effective_chat.id,
         file_id=file_id,
@@ -683,37 +666,34 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     if not story:
         await update.message.reply_text(
-            "❌ Erreur lors de la programmation. Réessaie ou contacte le support."
+            "❌ *Erreur technique*\n\n"
+            "Impossible de programmer la story. Réessaie ou contacte le support.",
+            parse_mode="Markdown"
         )
         return
 
+    # Nettoyer les données temporaires
     context.user_data.pop('current_media_file_id', None)
     context.user_data.pop('current_media_type', None)
     context.user_data.pop('media_timestamp', None)
     context.user_data.pop('to_close_friends', None)
     
-    time_until = run_date - now_tz()
-    hours = int(time_until.total_seconds() // 3600)
-    minutes = int((time_until.total_seconds() % 3600) // 60)
-    
-    audience_text = "✨ Amis proches uniquement" if to_close_friends else "👥 Tout le monde"
-    media_icon = "🎬" if media_type == "video" else "📸"
-    media_name = "Vidéo" if media_type == "video" else "Photo"
+    # Message de confirmation professionnel
+    confirmation_msg = create_confirmation_message(
+        scheduled_time=run_date,
+        reference_time=now,
+        media_type=media_type,
+        to_close_friends=to_close_friends
+    )
     
     keyboard = [
-        [InlineKeyboardButton("📋 Voir mes publications", callback_data="list_posts")],
-        [InlineKeyboardButton("📸 Programmer une autre story", callback_data="new_post")]
+        [InlineKeyboardButton("📋 Mes publications", callback_data="list_posts")],
+        [InlineKeyboardButton("➕ Programmer une autre", callback_data="new_post")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"✅ *{media_name} programmée avec succès !*\n\n"
-        f"{media_icon} Type : {media_name}\n"
-        f"📅 Date : {run_date.strftime('%d/%m/%Y à %H:%M')}{day_info}\n"
-        f"⏰ Dans : {hours}h {minutes}min\n"
-        f"👁️ Audience : {audience_text}\n\n"
-        f"🔔 Tu recevras une notification quand la story sera publiée.\n"
-        f"📌 Utilise /list pour voir toutes tes publications programmées.",
+        confirmation_msg,
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -776,28 +756,128 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     
+    # Gérer les boutons de temps rapides
+    if query.data.startswith("time_"):
+        file_id = context.user_data.get('current_media_file_id')
+        media_type = context.user_data.get('current_media_type', 'photo')
+        to_close_friends = context.user_data.get('to_close_friends', False)
+        
+        if not file_id:
+            await query.message.edit_text(
+                "❌ *Session expirée*\n\n"
+                "Le média n'est plus disponible. Envoie-le à nouveau.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Traiter le callback de temps
+        now = now_tz()
+        result = process_quick_time_callback(query.data, now, TIMEZONE)
+        
+        if result["action"] == "cancel":
+            context.user_data.pop('current_media_file_id', None)
+            context.user_data.pop('current_media_type', None)
+            context.user_data.pop('to_close_friends', None)
+            await query.message.edit_text(
+                "❌ *Publication annulée*\n\n"
+                "Envoie un nouveau média quand tu veux !",
+                parse_mode="Markdown"
+            )
+            return
+        
+        if result["action"] == "manual":
+            await query.message.edit_text(
+                f"✍️ *Saisie manuelle*\n\n"
+                f"{get_datetime_help_text()}",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Récupérer la date programmée
+        scheduled_time = result.get("scheduled_time")
+        if not scheduled_time:
+            await query.message.edit_text(
+                "❌ *Erreur de traitement*\n\n"
+                "Réessaie avec un autre bouton.",
+                parse_mode="Markdown",
+                reply_markup=get_quick_time_keyboard()
+            )
+            return
+        
+        # Valider
+        is_valid, error_message = validate_scheduled_time(scheduled_time, now)
+        if not is_valid:
+            await query.message.edit_text(
+                error_message,
+                parse_mode="Markdown",
+                reply_markup=get_quick_time_keyboard()
+            )
+            return
+        
+        # Créer la story
+        story = db.create_story(
+            chat_id=update.effective_chat.id,
+            file_id=file_id,
+            scheduled_time=scheduled_time,
+            to_close_friends=to_close_friends,
+            media_type=media_type
+        )
+        
+        if not story:
+            await query.message.edit_text(
+                "❌ *Erreur technique*\n\n"
+                "Impossible de programmer. Réessaie ou contacte le support.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Nettoyer
+        context.user_data.pop('current_media_file_id', None)
+        context.user_data.pop('current_media_type', None)
+        context.user_data.pop('media_timestamp', None)
+        context.user_data.pop('to_close_friends', None)
+        
+        # Confirmation pro
+        confirmation_msg = create_confirmation_message(
+            scheduled_time=scheduled_time,
+            reference_time=now,
+            media_type=media_type,
+            to_close_friends=to_close_friends
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Mes publications", callback_data="list_posts")],
+            [InlineKeyboardButton("➕ Programmer une autre", callback_data="new_post")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            confirmation_msg,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
+        return
+    
     if query.data == "audience_everyone":
         context.user_data['to_close_friends'] = False
+        keyboard = get_quick_time_keyboard()
         await query.message.edit_text(
             "👥 *Audience sélectionnée : Tout le monde*\n\n"
-            "📅 Maintenant, envoie l'heure ou la date de publication :\n\n"
-            "• `14:30` - aujourd'hui à 14h30\n"
-            "• `25/12 09:00` - le 25 décembre à 9h\n"
-            "• `2025-12-31 23:59` - format complet\n\n"
-            "💡 Si l'heure est déjà passée, la publication sera programmée pour demain.",
-            parse_mode="Markdown"
+            "⏰ Choisis l'heure de publication :\n\n"
+            "🎯 Utilise les boutons rapides ou envoie un message personnalisé.",
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
     
     elif query.data == "audience_close_friends":
         context.user_data['to_close_friends'] = True
+        keyboard = get_quick_time_keyboard()
         await query.message.edit_text(
             "✨ *Audience sélectionnée : Amis proches*\n\n"
-            "📅 Maintenant, envoie l'heure ou la date de publication :\n\n"
-            "• `14:30` - aujourd'hui à 14h30\n"
-            "• `25/12 09:00` - le 25 décembre à 9h\n"
-            "• `2025-12-31 23:59` - format complet\n\n"
-            "💡 Si l'heure est déjà passée, la publication sera programmée pour demain.",
-            parse_mode="Markdown"
+            "⏰ Choisis l'heure de publication :\n\n"
+            "🎯 Utilise les boutons rapides ou envoie un message personnalisé.",
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
     
     elif query.data == "new_post":
@@ -913,17 +993,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestionnaire de la commande /help - Affiche l'aide détaillée."""
+    datetime_help = get_datetime_help_text()
+    
     await update.message.reply_text(
         "📖 *Guide d'utilisation*\n\n"
         "*📸🎬 Programmer une story :*\n"
         "1. Envoie une photo (max 20 MB) ou vidéo (max 100 MB, 60s max)\n"
         "2. Choisis l'audience (tout le monde / amis proches)\n"
-        "3. Indique la date/heure de publication\n\n"
-        "*⏰ Formats acceptés :*\n"
-        "• `14:30` - Aujourd'hui à 14h30\n"
-        "• `25/12 09:00` - Le 25 déc à 9h\n"
-        "• `25/12/2025 09:00` - Format complet\n"
-        "• `2025-12-25 09:00` - Format ISO\n\n"
+        "3. Utilise les boutons rapides ou envoie une date/heure\n\n"
+        f"{datetime_help}\n\n"
         "*🔐 Authentification 2FA :*\n"
         "Si Instagram demande un code :\n"
         "1. Ouvre ton app **Google Authenticator**\n"
