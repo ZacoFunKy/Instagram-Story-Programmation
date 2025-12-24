@@ -340,20 +340,32 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         # Publication sur Instagram
         to_close_friends = story.get("to_close_friends", False)
         
-        # Publication selon le type de média avec gestion amis proches
+        # Récupérer les IDs des amis proches si nécessaire
+        story_recipients = None
+        if to_close_friends:
+            try:
+                besties = cl.close_friend_list()
+                if besties:
+                    # Convertir en liste d'IDs pour l'API Instagram
+                    story_recipients = [str(user.pk) for user in besties]
+                    logging.info("📌 %d amis proches trouvés", len(story_recipients))
+                else:
+                    logging.warning("⚠️ Liste amis proches vide, publication en mode public")
+            except Exception as e:
+                logging.error("❌ Erreur récupération amis proches: %s - Publication en mode public", e)
+        
+        # Publication selon le type de média
         if media_type == "video":
-            if to_close_friends:
-                # Pour les amis proches, utiliser thread_ids="CLOSE_FRIENDS"
-                cl.video_upload_to_story(media_path, thread_ids="CLOSE_FRIENDS")
-                logging.info("🎬 Vidéo publiée sur Instagram (Amis proches uniquement)")
+            if story_recipients:
+                cl.video_upload_to_story(media_path, to=story_recipients)
+                logging.info("🎬 Vidéo publiée pour %d amis proches", len(story_recipients))
             else:
                 cl.video_upload_to_story(media_path)
                 logging.info("🎬 Vidéo publiée sur Instagram")
         else:
-            if to_close_friends:
-                # Pour les amis proches, utiliser thread_ids="CLOSE_FRIENDS"
-                cl.photo_upload_to_story(media_path, thread_ids="CLOSE_FRIENDS")
-                logging.info("📸 Photo publiée sur Instagram (Amis proches uniquement)")
+            if story_recipients:
+                cl.photo_upload_to_story(media_path, to=story_recipients)
+                logging.info("📸 Photo publiée pour %d amis proches", len(story_recipients))
             else:
                 cl.photo_upload_to_story(media_path)
                 logging.info("📸 Photo publiée sur Instagram")
