@@ -33,7 +33,9 @@ class DBManager:
         file_id: str,
         scheduled_time: datetime,
         to_close_friends: bool = False,
-        media_type: str = "photo"
+        media_type: str = "photo",
+        file_size_bytes: int | None = None,
+        original_filename: str | None = None
     ) -> Optional[dict]:
         """
         Crée une nouvelle story programmée dans la base de données.
@@ -57,13 +59,25 @@ class DBManager:
                 "media_type": media_type,
                 "scheduled_time": scheduled_utc.isoformat(),
                 "status": "PENDING",
-                "to_close_friends": to_close_friends
+                "to_close_friends": to_close_friends,
+                "file_size_bytes": file_size_bytes,
+                "original_filename": original_filename
             }
             
             result = self.client.table("stories").insert(data).execute()
             
             if result.data:
                 story = result.data[0]
+                self.log_story_event(
+                    story.get("id"),
+                    "CREATED",
+                    {
+                        "media_type": media_type,
+                        "to_close_friends": to_close_friends,
+                        "file_size_bytes": file_size_bytes,
+                        "original_filename": original_filename,
+                    }
+                )
                 self.logger.info(
                     "Story créée - ID: %s, Chat: %s, Type: %s, Scheduled: %s",
                     story.get("id"),
@@ -106,7 +120,10 @@ class DBManager:
         self,
         story_id: str,
         status: str,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        published_at: datetime | None = None,
+        instagram_story_id: str | None = None,
+        retry_count: int | None = None
     ) -> bool:
         """
         Met à jour le statut d'une story.
@@ -120,9 +137,23 @@ class DBManager:
             True si la mise à jour a réussi, False sinon
         """
         try:
-            data = {"status": status}
+            data = {
+                "status": status,
+                "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
+            }
             if error_message:
                 data["error_message"] = error_message
+            if published_at:
+                # Toujours stocker en UTC
+                published_utc = published_at
+                if published_utc.tzinfo is None:
+                    published_utc = published_utc.replace(tzinfo=ZoneInfo("UTC"))
+                published_utc = published_utc.astimezone(ZoneInfo("UTC"))
+                data["published_at"] = published_utc.isoformat()
+            if instagram_story_id:
+                data["instagram_story_id"] = instagram_story_id
+            if retry_count is not None:
+                data["retry_count"] = retry_count
             
             result = self.client.table("stories")\
                 .update(data)\
@@ -213,10 +244,18 @@ class DBManager:
             Dictionnaire avec les statistiques (pending, published, error counts)
         """
         try:
-            result = self.client.table("stories_stats")\
-                .select("*")\
-                .eq("chat_id", chat_id)\
-                .execute()
+            # Préférence pour la vue story_statistics (nouveau schéma)
+            try:
+                result = self.client.table("story_statistics")\
+                    .select("*")\
+                    .eq("chat_id", chat_id)\
+                    .execute()
+            except Exception:
+                # Fallback ancien nom si présent
+                result = self.client.table("stories_stats")\
+                    .select("*")\
+                    .eq("chat_id", chat_id)\
+                    .execute()
             
             if result.data and len(result.data) > 0:
                 return result.data[0]
@@ -236,6 +275,21 @@ class DBManager:
                 "error_count": 0,
                 "cancelled_count": 0
             }
+
+    def log_story_event(self, story_id: str | None, event_type: str, event_data: dict | None = None) -> None:
+        """Insère un événement dans story_events si la table existe."""
+        if not story_id:
+            return
+        try:
+            payload = {
+                "story_id": story_id,
+                "event_type": event_type,
+                "event_data": event_data or {},
+            }
+            self.client.table("story_events").insert(payload).execute()
+        except Exception as exc:
+            # Ne jamais bloquer le flux métier pour un log
+            self.logger.debug("Impossible d'enregistrer l'événement %s: %s", event_type, exc)
 
     def cleanup_old_stories(self, days: int = 30) -> int:
         """

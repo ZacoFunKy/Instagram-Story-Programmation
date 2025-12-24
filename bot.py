@@ -268,6 +268,20 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
     logging.info("📤 Publication de la story %s (%s) pour le chat %s", story_id, media_type, chat_id)
     
     media_path = None
+
+    def _extract_story_id(media_obj: object) -> str | None:
+        """Récupère l'identifiant de story renvoyé par instagrapi."""
+        try:
+            if hasattr(media_obj, "pk"):
+                return str(media_obj.pk)
+            if isinstance(media_obj, dict):
+                if media_obj.get("pk"):
+                    return str(media_obj.get("pk"))
+                if media_obj.get("id"):
+                    return str(media_obj.get("id"))
+        except Exception:
+            return None
+        return None
     try:
         # Télécharger le média depuis Telegram
         import asyncio
@@ -292,7 +306,17 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         if not instagram_login(chat_id, None):
             error_msg = "Connexion Instagram impossible"
             logging.warning(error_msg)
-            db.update_story_status(story_id, "ERROR", error_msg)
+            db.update_story_status(
+                story_id,
+                "ERROR",
+                error_msg,
+                retry_count=(story.get("retry_count") or 0) + 1
+            )
+            db.log_story_event(
+                story_id,
+                "ERROR",
+                {"stage": "login", "message": error_msg}
+            )
             # Envoyer via API Telegram de manière synchrone
             try:
                 requests.post(
@@ -316,33 +340,50 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
                     "Amis proches" if to_close_friends else "Public")
         
         # Publication selon le type de média
+        media_response = None
         try:
             if media_type == "video":
                 if to_close_friends:
                     logging.info("🎬 Publication vidéo pour amis proches...")
                     # Audience close friends via extra_data
                     extra_data = {"audience": "besties"}
-                    cl.video_upload_to_story(media_path, extra_data=extra_data)
+                    media_response = cl.video_upload_to_story(media_path, extra_data=extra_data)
                     logging.info("🎬 Vidéo publiée pour amis proches ✨")
                 else:
-                    cl.video_upload_to_story(media_path)
+                    media_response = cl.video_upload_to_story(media_path)
                     logging.info("🎬 Vidéo publiée sur Instagram")
             else:
                 if to_close_friends:
                     logging.info("📸 Publication photo pour amis proches...")
                     # Audience close friends via extra_data
                     extra_data = {"audience": "besties"}
-                    cl.photo_upload_to_story(media_path, extra_data=extra_data)
+                    media_response = cl.photo_upload_to_story(media_path, extra_data=extra_data)
                     logging.info("📸 Photo publiée pour amis proches ✨")
                 else:
-                    cl.photo_upload_to_story(media_path)
+                    media_response = cl.photo_upload_to_story(media_path)
                     logging.info("📸 Photo publiée sur Instagram")
         except Exception as upload_err:
             logging.error("❌ Erreur upload story: %s", upload_err)
             raise
         
-        # Mise à jour du statut
-        db.update_story_status(story_id, "PUBLISHED")
+        # Mise à jour du statut + métadonnées de publication
+        published_at = datetime.now(ZoneInfo("UTC"))
+        instagram_story_id = _extract_story_id(media_response)
+        db.update_story_status(
+            story_id,
+            "PUBLISHED",
+            published_at=published_at,
+            instagram_story_id=instagram_story_id
+        )
+        db.log_story_event(
+            story_id,
+            "PUBLISHED",
+            {
+                "instagram_story_id": instagram_story_id,
+                "media_type": media_type,
+                "to_close_friends": to_close_friends,
+            }
+        )
         
         # Notification de succès (API Telegram synchrone)
         media_icon = "🎬" if media_type == "video" else "📸"
@@ -370,7 +411,17 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
     except Exception as exc:
         error_msg = str(exc)
         logging.exception("❌ Erreur lors de la publication de la story %s", story_id)
-        db.update_story_status(story_id, "ERROR", error_msg)
+        db.update_story_status(
+            story_id,
+            "ERROR",
+            error_msg,
+            retry_count=(story.get("retry_count") or 0) + 1
+        )
+        db.log_story_event(
+            story_id,
+            "ERROR",
+            {"stage": "publish", "message": error_msg}
+        )
         
         try:
             requests.post(
@@ -492,6 +543,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     media_type = None
     file_id = None
     file_size = None
+    original_filename: str | None = None
     quality_warning = ""
     media_icon = ""
     
@@ -531,6 +583,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         doc = update.message.document
         file_id = doc.file_id
         file_size = doc.file_size
+        original_filename = doc.file_name
         
         # Vérifier que c'est bien une image ou vidéo
         if not doc.mime_type:
@@ -569,6 +622,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Stocker les informations du média
     context.user_data['current_media_file_id'] = file_id
     context.user_data['current_media_type'] = media_type
+    context.user_data['current_media_file_size'] = file_size
+    context.user_data['current_media_filename'] = original_filename
     context.user_data['media_timestamp'] = now_tz()
     
     keyboard = [
@@ -597,6 +652,8 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if 'current_media_file_id' in context.user_data:
         context.user_data.pop('current_media_file_id', None)
         context.user_data.pop('current_media_type', None)
+        context.user_data.pop('current_media_file_size', None)
+        context.user_data.pop('current_media_filename', None)
         context.user_data.pop('media_timestamp', None)
         await update.message.reply_text(
             "❌ *Programmation annulée*\n\n"
@@ -661,7 +718,9 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         file_id=file_id,
         scheduled_time=run_date,
         to_close_friends=to_close_friends,
-        media_type=media_type
+        media_type=media_type,
+        file_size_bytes=context.user_data.get('current_media_file_size'),
+        original_filename=context.user_data.get('current_media_filename')
     )
     
     if not story:
@@ -675,6 +734,8 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Nettoyer les données temporaires
     context.user_data.pop('current_media_file_id', None)
     context.user_data.pop('current_media_type', None)
+    context.user_data.pop('current_media_file_size', None)
+    context.user_data.pop('current_media_filename', None)
     context.user_data.pop('media_timestamp', None)
     context.user_data.pop('to_close_friends', None)
     
@@ -777,6 +838,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if result["action"] == "cancel":
             context.user_data.pop('current_media_file_id', None)
             context.user_data.pop('current_media_type', None)
+            context.user_data.pop('current_media_file_size', None)
+            context.user_data.pop('current_media_filename', None)
             context.user_data.pop('to_close_friends', None)
             await query.message.edit_text(
                 "❌ *Publication annulée*\n\n"
@@ -820,7 +883,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             file_id=file_id,
             scheduled_time=scheduled_time,
             to_close_friends=to_close_friends,
-            media_type=media_type
+            media_type=media_type,
+            file_size_bytes=context.user_data.get('current_media_file_size'),
+            original_filename=context.user_data.get('current_media_filename')
         )
         
         if not story:
@@ -835,6 +900,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop('current_media_file_id', None)
         context.user_data.pop('current_media_type', None)
         context.user_data.pop('media_timestamp', None)
+        context.user_data.pop('current_media_file_size', None)
+        context.user_data.pop('current_media_filename', None)
         context.user_data.pop('to_close_friends', None)
         
         # Confirmation pro
