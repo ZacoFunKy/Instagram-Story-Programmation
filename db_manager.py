@@ -5,6 +5,7 @@ Gère toutes les interactions avec Supabase PostgreSQL.
 
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 from uuid import UUID
 
@@ -44,10 +45,12 @@ class DBManager:
             Dictionnaire contenant les données de la story créée, ou None en cas d'erreur
         """
         try:
+            # Convertir la date de publication en UTC pour une persistance cohérente
+            scheduled_utc = scheduled_time.astimezone(ZoneInfo("UTC"))
             data = {
                 "chat_id": chat_id,
                 "file_id": file_id,
-                "scheduled_time": scheduled_time.isoformat(),
+                "scheduled_time": scheduled_utc.isoformat(),
                 "status": "PENDING"
             }
             
@@ -76,7 +79,8 @@ class DBManager:
             Liste des stories à publier
         """
         try:
-            now = datetime.now().isoformat()
+            # Utiliser l'heure actuelle en UTC pour la comparaison côté BDD
+            now = datetime.now(ZoneInfo("UTC")).isoformat()
             
             result = self.client.table("stories")\
                 .select("*")\
@@ -238,7 +242,7 @@ class DBManager:
         """
         try:
             from datetime import timedelta
-            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+            cutoff_date = (datetime.now(ZoneInfo("UTC")) - timedelta(days=days)).isoformat()
             
             result = self.client.table("stories")\
                 .delete()\

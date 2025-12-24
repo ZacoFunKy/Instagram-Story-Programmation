@@ -10,6 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from flask import Flask
 from instagrapi import Client
+import requests
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -114,8 +115,8 @@ def parse_run_date(text: str, now: datetime) -> tuple[datetime | None, bool]:
 
     try:
         t = datetime.strptime(text, "%H:%M").time()
-        # Combiner avec la date actuelle ET la timezone
-        dt = datetime.combine(now.date(), t, tzinfo=TIMEZONE)
+        # Combiner avec la date actuelle puis appliquer la timezone
+        dt = datetime.combine(now.date(), t).replace(tzinfo=TIMEZONE)
         return dt, False
     except ValueError:
         return None, False
@@ -167,7 +168,8 @@ def instagram_login(
 
             if "Two-factor" in msg or "verification_code" in msg or "challenge_required" in msg:
                 if context and chat_id:
-                    asyncio.create_task(
+                    # Programmer l'envoi sur la boucle de l'application Telegram
+                    context.application.create_task(
                         context.bot.send_message(
                             chat_id=chat_id,
                             text=(
@@ -182,7 +184,7 @@ def instagram_login(
                     )
             else:
                 if context and chat_id:
-                    asyncio.create_task(
+                    context.application.create_task(
                         context.bot.send_message(
                             chat_id=chat_id,
                             text=f"❌ Connexion Instagram impossible: {msg}"
@@ -234,10 +236,18 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
             error_msg = "Connexion Instagram impossible"
             logging.warning(error_msg)
             db.update_story_status(story_id, "ERROR", error_msg)
-            bot_instance.send_message(
-                chat_id=chat_id,
-                text=f"❌ Publication annulée: {error_msg}"
-            )
+            # Envoyer via API Telegram de manière synchrone
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": f"❌ Publication annulée: {error_msg}"
+                    },
+                    timeout=10
+                )
+            except Exception as notify_err:
+                logging.error("Notification Telegram échouée: %s", notify_err)
             return
 
         # Publication sur Instagram
@@ -246,11 +256,18 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         # Mise à jour du statut
         db.update_story_status(story_id, "PUBLISHED")
         
-        # Notification de succès
-        bot_instance.send_message(
-            chat_id=chat_id,
-            text="✅ Story publiée avec succès sur Instagram !"
-        )
+        # Notification de succès (API Telegram synchrone)
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": "✅ Story publiée avec succès sur Instagram !"
+                },
+                timeout=10
+            )
+        except Exception as notify_err:
+            logging.error("Notification Telegram échouée: %s", notify_err)
         logging.info("✅ Story %s publiée avec succès", story_id)
         
     except Exception as exc:
@@ -259,9 +276,13 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         db.update_story_status(story_id, "ERROR", error_msg)
         
         try:
-            bot_instance.send_message(
-                chat_id=chat_id,
-                text=f"❌ Erreur lors de la publication: {error_msg}"
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": f"❌ Erreur lors de la publication: {error_msg}"
+                },
+                timeout=10
             )
         except Exception as notify_exc:
             logging.error("Impossible d'envoyer la notification d'erreur: %s", notify_exc)
@@ -331,7 +352,9 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     for idx, story in enumerate(user_stories, 1):
         scheduled_time = datetime.fromisoformat(story["scheduled_time"].replace("Z", "+00:00"))
-        time_until = scheduled_time - now_tz()
+        # Convertir en timezone Paris pour affichage
+        scheduled_local = scheduled_time.astimezone(TIMEZONE)
+        time_until = scheduled_local - now_tz()
         
         if time_until.total_seconds() > 0:
             hours = int(time_until.total_seconds() // 3600)
@@ -340,7 +363,7 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             time_str = "en cours..."
         
-        message += f"{idx}. 📅 {scheduled_time.strftime('%d/%m/%Y à %H:%M')}\n"
+        message += f"{idx}. 📅 {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
         message += f"   ⏰ {time_str}\n\n"
         
         keyboard.append([
@@ -561,7 +584,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         for idx, story in enumerate(user_stories, 1):
             scheduled_time = datetime.fromisoformat(story["scheduled_time"].replace("Z", "+00:00"))
-            time_until = scheduled_time - now_tz()
+            scheduled_local = scheduled_time.astimezone(TIMEZONE)
+            time_until = scheduled_local - now_tz()
             
             if time_until.total_seconds() > 0:
                 hours = int(time_until.total_seconds() // 3600)
@@ -570,7 +594,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 time_str = "en cours..."
             
-            message += f"{idx}. 📅 {scheduled_time.strftime('%d/%m/%Y à %H:%M')}\n"
+            message += f"{idx}. 📅 {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
             message += f"   ⏰ {time_str}\n\n"
             
             keyboard.append([
