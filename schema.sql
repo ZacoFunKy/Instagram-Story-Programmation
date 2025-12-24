@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS stories (
     file_id TEXT NOT NULL,
     scheduled_time TIMESTAMPTZ NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    to_close_friends BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     error_message TEXT,

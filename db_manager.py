@@ -31,7 +31,8 @@ class DBManager:
         self,
         chat_id: int,
         file_id: str,
-        scheduled_time: datetime
+        scheduled_time: datetime,
+        to_close_friends: bool = False
     ) -> Optional[dict]:
         """
         Crée une nouvelle story programmée dans la base de données.
@@ -40,6 +41,7 @@ class DBManager:
             chat_id: ID du chat Telegram
             file_id: ID du fichier photo sur Telegram
             scheduled_time: Date/heure de publication programmée
+            to_close_friends: True si la story est uniquement pour les amis proches
         
         Returns:
             Dictionnaire contenant les données de la story créée, ou None en cas d'erreur
@@ -51,7 +53,8 @@ class DBManager:
                 "chat_id": chat_id,
                 "file_id": file_id,
                 "scheduled_time": scheduled_utc.isoformat(),
-                "status": "PENDING"
+                "status": "PENDING",
+                "to_close_friends": to_close_friends
             }
             
             result = self.client.table("stories").insert(data).execute()

@@ -335,7 +335,21 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
             return
 
         # Publication sur Instagram
-        cl.photo_upload_to_story(image_path)
+        to_close_friends = story.get("to_close_friends", False)
+        
+        # Paramètres additionnels pour la story
+        extra_data = {}
+        if to_close_friends:
+            # Liste des user IDs des amis proches (besoin de les récupérer d'abord)
+            try:
+                besties = cl.close_friend_list()
+                if besties:
+                    extra_data["audience"] = "besties"
+                    logging.info("📌 Story sera publiée pour les amis proches uniquement")
+            except Exception as e:
+                logging.warning("Impossible de récupérer la liste d'amis proches: %s", e)
+        
+        cl.photo_upload_to_story(image_path, extra_data=extra_data)
         
         # Mise à jour du statut
         db.update_story_status(story_id, "PUBLISHED")
@@ -448,7 +462,13 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             time_str = "en cours..."
         
         message += f"{idx}. 📅 {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
-        message += f"   ⏰ {time_str}\n\n"
+        message += f"   ⏰ {time_str}\n"
+        
+        # Afficher l'audience si amis proches
+        if story.get("to_close_friends"):
+            message += f"   ✨ Amis proches\n"
+        
+        message += "\n"
         
         keyboard.append([
             InlineKeyboardButton(f"❌ Annuler #{idx}", callback_data=f"cancel_{story['id']}")
@@ -485,17 +505,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.user_data['photo_timestamp'] = now_tz()
     
     keyboard = [
+        [
+            InlineKeyboardButton("👥 Tout le monde", callback_data="audience_everyone"),
+            InlineKeyboardButton("✨ Amis proches", callback_data="audience_close_friends")
+        ],
         [InlineKeyboardButton("❌ Annuler", callback_data="cancel_photo")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "📸 *Photo reçue avec succès !*\n\n"
-        "📅 Maintenant, envoie l'heure ou la date de publication :\n\n"
-        "• `14:30` - aujourd'hui à 14h30\n"
-        "• `25/12 09:00` - le 25 décembre à 9h\n"
-        "• `2025-12-31 23:59` - format complet\n\n"
-        "💡 Si l'heure est déjà passée, la publication sera programmée pour demain.",
+        "👥 *Qui peut voir cette story ?*\n"
+        "• Tout le monde - Visible par tous tes abonnés\n"
+        "• Amis proches - Uniquement ta liste d'amis proches\n\n"
+        "Choisis une option ci-dessous :",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -547,10 +570,12 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         day_info = ""
 
     # Créer la story dans la base de données
+    to_close_friends = context.user_data.get('to_close_friends', False)
     story = db.create_story(
         chat_id=update.effective_chat.id,
         file_id=file_id,
-        scheduled_time=run_date
+        scheduled_time=run_date,
+        to_close_friends=to_close_friends
     )
     
     if not story:
@@ -561,10 +586,13 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     context.user_data.pop('current_photo_file_id', None)
     context.user_data.pop('photo_timestamp', None)
+    context.user_data.pop('to_close_friends', None)
     
     time_until = run_date - now_tz()
     hours = int(time_until.total_seconds() // 3600)
     minutes = int((time_until.total_seconds() % 3600) // 60)
+    
+    audience_text = "✨ Amis proches uniquement" if to_close_friends else "👥 Tout le monde"
     
     keyboard = [
         [InlineKeyboardButton("📋 Voir mes publications", callback_data="list_posts")],
@@ -575,7 +603,8 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         f"✅ *Publication programmée avec succès !*\n\n"
         f"📅 Date : {run_date.strftime('%d/%m/%Y à %H:%M')}{day_info}\n"
-        f"⏰ Dans : {hours}h {minutes}min\n\n"
+        f"⏰ Dans : {hours}h {minutes}min\n"
+        f"👁️ Audience : {audience_text}\n\n"
         f"🔔 Tu recevras une notification quand la story sera publiée.\n"
         f"📌 Utilise /list pour voir toutes tes publications programmées.",
         parse_mode="Markdown",
@@ -640,7 +669,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     
-    if query.data == "new_post":
+    if query.data == "audience_everyone":
+        context.user_data['to_close_friends'] = False
+        await query.message.edit_text(
+            "👥 *Audience sélectionnée : Tout le monde*\n\n"
+            "📅 Maintenant, envoie l'heure ou la date de publication :\n\n"
+            "• `14:30` - aujourd'hui à 14h30\n"
+            "• `25/12 09:00` - le 25 décembre à 9h\n"
+            "• `2025-12-31 23:59` - format complet\n\n"
+            "💡 Si l'heure est déjà passée, la publication sera programmée pour demain.",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == "audience_close_friends":
+        context.user_data['to_close_friends'] = True
+        await query.message.edit_text(
+            "✨ *Audience sélectionnée : Amis proches*\n\n"
+            "📅 Maintenant, envoie l'heure ou la date de publication :\n\n"
+            "• `14:30` - aujourd'hui à 14h30\n"
+            "• `25/12 09:00` - le 25 décembre à 9h\n"
+            "• `2025-12-31 23:59` - format complet\n\n"
+            "💡 Si l'heure est déjà passée, la publication sera programmée pour demain.",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == "new_post":
         await query.message.reply_text(
             "📸 Envoie-moi une photo pour programmer une nouvelle story !"
         )
@@ -679,7 +732,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 time_str = "en cours..."
             
             message += f"{idx}. 📅 {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
-            message += f"   ⏰ {time_str}\n\n"
+            message += f"   ⏰ {time_str}\n"
+            
+            # Afficher l'audience si amis proches
+            if story.get("to_close_friends"):
+                message += f"   ✨ Amis proches\n"
+            
+            message += "\n"
             
             keyboard.append([
                 InlineKeyboardButton(f"❌ Annuler #{idx}", callback_data=f"cancel_{story['id']}")
