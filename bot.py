@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 from flask import Flask
 from instagrapi import Client
 import requests
+try:
+    import pyotp  # Optional: for Google Authenticator TOTP
+except Exception:  # pragma: no cover
+    pyotp = None
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -37,6 +41,15 @@ DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 SESSION_FILE = os.path.join(DOWNLOAD_DIR, "ig_session.json")
 HTTP_PORT = int(os.environ.get("PORT", "8000"))
 
+# 2FA & réseau (optionnels)
+IG_TOTP_SECRET = os.environ.get("IG_TOTP_SECRET")  # secret base32 pour Google Authenticator
+IG_SESSIONID = os.environ.get("IG_SESSIONID")  # cookie sessionid Instagram (optionnel)
+PROXY_URL = (
+    os.environ.get("PROXY_URL")
+    or os.environ.get("HTTPS_PROXY")
+    or os.environ.get("HTTP_PROXY")
+)
+
 # Timezone - Utiliser la timezone de Paris pour éviter les décalages
 TIMEZONE = ZoneInfo("Europe/Paris")
 
@@ -52,6 +65,20 @@ scheduler.start()
 cl = Client()
 web = Flask(__name__)
 db = DBManager(SUPABASE_URL, SUPABASE_KEY)
+
+# Configurer un proxy si fourni
+if PROXY_URL:
+    try:
+        cl.set_proxy(PROXY_URL)
+        logging.info("Proxy configuré pour Instagram API")
+    except Exception as e:
+        logging.warning("Impossible de configurer le proxy: %s", e)
+
+# Ralentir les requêtes pour paraître plus humain
+try:
+    cl.delay_range = [1, 3]
+except Exception:
+    pass
 
 
 @web.route("/health")
@@ -70,6 +97,8 @@ def load_instagram_session() -> None:
     if os.path.exists(SESSION_FILE):
         try:
             cl.load_settings(SESSION_FILE)
+            if PROXY_URL:
+                cl.set_proxy(PROXY_URL)
             logging.info("Session Instagram chargée depuis le disque")
         except Exception as exc:
             logging.warning("Impossible de charger la session Instagram: %s", exc)
@@ -145,6 +174,16 @@ def instagram_login(
             if not force and cl.user_id:
                 return True
 
+            # Option 1: login par sessionid (bypasse mot de passe/2FA)
+            if IG_SESSIONID:
+                try:
+                    cl.login_by_sessionid(IG_SESSIONID)
+                    save_instagram_session()
+                    logging.info("✅ Connexion Instagram via sessionid")
+                    return True
+                except Exception as sessionid_exc:
+                    logging.warning("Echec login sessionid: %s", sessionid_exc)
+
             # Essayer de charger la session d'abord
             if os.path.exists(SESSION_FILE) and not force:
                 try:
@@ -156,7 +195,35 @@ def instagram_login(
                     logging.warning("Impossible de réutiliser la session: %s", session_exc)
 
             # Connexion normale avec 2FA si nécessaire
-            cl.login(IG_USER, IG_PASS, verification_code=two_factor_code)
+            # Générer un code TOTP si secret fourni et aucun code /code en attente
+            code_to_use = two_factor_code
+            used_totp = False
+            if not code_to_use and IG_TOTP_SECRET and pyotp:
+                try:
+                    sanitized_secret = IG_TOTP_SECRET.replace(" ", "").strip().upper()
+                    code_to_use = pyotp.TOTP(sanitized_secret).now()
+                    used_totp = True
+                    logging.info("Code TOTP généré automatiquement pour 2FA")
+                except Exception as e:
+                    logging.warning("Impossible de générer le TOTP: %s", e)
+
+            try:
+                cl.login(IG_USER, IG_PASS, verification_code=code_to_use)
+            except Exception as first_exc:
+                # Si le code 2FA semble invalide et qu'on utilise TOTP, retenter une seule fois
+                msg1 = str(first_exc).lower()
+                if used_totp and (
+                    "code" in msg1 or "two-factor" in msg1 or "verification" in msg1
+                ) and IG_TOTP_SECRET and pyotp:
+                    try:
+                        sanitized_secret = IG_TOTP_SECRET.replace(" ", "").strip().upper()
+                        new_code = pyotp.TOTP(sanitized_secret).now()
+                        logging.info("Retry login avec un nouveau TOTP")
+                        cl.login(IG_USER, IG_PASS, verification_code=new_code)
+                    except Exception:
+                        raise first_exc
+                else:
+                    raise first_exc
             two_factor_code = None
             save_instagram_session()
             logging.info("✅ Connexion Instagram réussie")
@@ -181,6 +248,23 @@ def instagram_login(
                             ),
                             parse_mode="Markdown"
                         )
+                    )
+            elif "blacklist" in msg.lower() or "bad password" in msg.lower():
+                # IP Render blacklistée ou mot de passe refusé côté serveur
+                help_text = (
+                    "❌ Connexion refusée par Instagram.\n\n"
+                    "Causes probables :\n"
+                    "• IP du serveur bloquée (blacklist)\n"
+                    "• Mot de passe refusé\n\n"
+                    "Solutions :\n"
+                    "1) Faire une 1ère connexion en local (2FA) pour créer la session,\n"
+                    "   puis copier `ig_session.json` vers `/data` sur Render.\n"
+                    "2) Fournir `IG_SESSIONID` (cookie session) dans les variables d'environnement.\n"
+                    "3) Configurer un proxy propre via `PROXY_URL`."
+                )
+                if context and chat_id:
+                    context.application.create_task(
+                        context.bot.send_message(chat_id=chat_id, text=help_text)
                     )
             else:
                 if context and chat_id:
