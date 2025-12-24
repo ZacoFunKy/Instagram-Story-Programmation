@@ -340,42 +340,30 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         # Publication sur Instagram
         to_close_friends = story.get("to_close_friends", False)
         
-        # Récupérer les IDs des amis proches si nécessaire
-        story_recipients: list[str] | None = None
-        if to_close_friends:
-            try:
-                besties = cl.close_friend_list()
-                if besties:
-                    story_recipients = [str(user.pk) for user in besties]
-                    logging.info("📌 %d amis proches trouvés", len(story_recipients))
-                else:
-                    logging.warning("⚠️ Liste amis proches vide, publication en mode public")
-            except Exception as e:
-                logging.error("❌ Erreur récupération amis proches: %s - Publication en mode public", e)
+        # Note: Avec instagrapi 2.1.2, on utilise le paramètre audience directement
+        # plutôt que de récupérer les IDs des amis proches
+        logging.info("Publication story - Audience: %s", 
+                    "Amis proches" if to_close_friends else "Public")
         
         # Publication selon le type de média
         try:
             if media_type == "video":
-                if story_recipients:
-                    try:
-                        cl.video_upload_to_story(media_path, audience="besties")
-                        logging.info("🎬 Vidéo publiée (audience=besties)")
-                    except Exception as primary_err:
-                        logging.warning("Fallback besties->to: %s", primary_err)
-                        cl.video_upload_to_story(media_path, to=story_recipients)
-                        logging.info("🎬 Vidéo publiée pour %d amis proches", len(story_recipients))
+                if to_close_friends:
+                    logging.info("🎬 Publication vidéo pour amis proches...")
+                    # Audience close friends via extra_data
+                    extra_data = {"audience": "besties"}
+                    cl.video_upload_to_story(media_path, extra_data=extra_data)
+                    logging.info("🎬 Vidéo publiée pour amis proches ✨")
                 else:
                     cl.video_upload_to_story(media_path)
                     logging.info("🎬 Vidéo publiée sur Instagram")
             else:
-                if story_recipients:
-                    try:
-                        cl.photo_upload_to_story(media_path, audience="besties")
-                        logging.info("📸 Photo publiée (audience=besties)")
-                    except Exception as primary_err:
-                        logging.warning("Fallback besties->to: %s", primary_err)
-                        cl.photo_upload_to_story(media_path, to=story_recipients)
-                        logging.info("📸 Photo publiée pour %d amis proches", len(story_recipients))
+                if to_close_friends:
+                    logging.info("📸 Publication photo pour amis proches...")
+                    # Audience close friends via extra_data
+                    extra_data = {"audience": "besties"}
+                    cl.photo_upload_to_story(media_path, extra_data=extra_data)
+                    logging.info("📸 Photo publiée pour amis proches ✨")
                 else:
                     cl.photo_upload_to_story(media_path)
                     logging.info("📸 Photo publiée sur Instagram")
@@ -389,12 +377,19 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         # Notification de succès (API Telegram synchrone)
         media_icon = "🎬" if media_type == "video" else "📸"
         media_name = "Vidéo" if media_type == "video" else "Photo"
+        
+        # Créer le message avec les détails appropriés
+        if to_close_friends:
+            success_text = f"✅ {media_name} publiée pour tes amis proches ! ✨ {media_icon}"
+        else:
+            success_text = f"✅ {media_name} publiée avec succès sur Instagram ! {media_icon}"
+        
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                 json={
                     "chat_id": chat_id,
-                    "text": f"✅ {media_name} publiée avec succès sur Instagram ! {media_icon}"
+                    "text": success_text
                 },
                 timeout=10
             )
@@ -495,10 +490,11 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             time_str = "en cours..."
         
-            # Icône selon le type de média
-            media_icon = "🎬" if story.get("media_type") == "video" else "📸"
-            
-            message += f"{idx}. {media_icon} {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
+        # Icône selon le type de média
+        media_icon = "🎬" if story.get("media_type") == "video" else "📸"
+        
+        message += f"{idx}. {media_icon} {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
+        message += f"   ⏰ {time_str}\n"
         if story.get("to_close_friends"):
             message += f"   ✨ Amis proches\n"
         

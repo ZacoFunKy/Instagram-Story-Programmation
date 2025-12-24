@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: insta-story-bot
+    env: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    autoDeploy: true
+    envVars:
+      - key: TOKEN
+        sync: false
+      - key: IG_USER
+        sync: false
+      - key: IG_PASS
+        sync: false
+      - key: IG_TOTP_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: PROXY_URL
+        sync: false
+    disks:
+      - name: ig-session
+        mountPath: data
+        sizeGB: 1
