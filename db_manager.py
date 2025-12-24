@@ -32,16 +32,18 @@ class DBManager:
         chat_id: int,
         file_id: str,
         scheduled_time: datetime,
-        to_close_friends: bool = False
+        to_close_friends: bool = False,
+        media_type: str = "photo"
     ) -> Optional[dict]:
         """
         Crée une nouvelle story programmée dans la base de données.
         
         Args:
             chat_id: ID du chat Telegram
-            file_id: ID du fichier photo sur Telegram
+            file_id: ID du fichier photo/vidéo sur Telegram
             scheduled_time: Date/heure de publication programmée
             to_close_friends: True si la story est uniquement pour les amis proches
+            media_type: Type de média ('photo' ou 'video')
         
         Returns:
             Dictionnaire contenant les données de la story créée, ou None en cas d'erreur
@@ -52,6 +54,7 @@ class DBManager:
             data = {
                 "chat_id": chat_id,
                 "file_id": file_id,
+                "media_type": media_type,
                 "scheduled_time": scheduled_utc.isoformat(),
                 "status": "PENDING",
                 "to_close_friends": to_close_friends
@@ -62,9 +65,10 @@ class DBManager:
             if result.data:
                 story = result.data[0]
                 self.logger.info(
-                    "Story créée - ID: %s, Chat: %s, Scheduled: %s",
+                    "Story créée - ID: %s, Chat: %s, Type: %s, Scheduled: %s",
                     story.get("id"),
                     chat_id,
+                    media_type,
                     scheduled_time
                 )
                 return story

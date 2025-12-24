@@ -293,26 +293,29 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
     story_id = story["id"]
     file_id = story["file_id"]
     chat_id = story["chat_id"]
+    media_type = story.get("media_type", "photo")
     
-    logging.info("📤 Publication de la story %s pour le chat %s", story_id, chat_id)
+    logging.info("📤 Publication de la story %s (%s) pour le chat %s", story_id, media_type, chat_id)
     
-    image_path = None
+    media_path = None
     try:
-        # Télécharger l'image depuis Telegram
+        # Télécharger le média depuis Telegram
         import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         async def download_file():
             file = await bot_instance.get_file(file_id)
+            # Extension selon le type de média
+            ext = "mp4" if media_type == "video" else "jpg"
             path = os.path.join(
                 DOWNLOAD_DIR,
-                f"temp_story_{now_tz().strftime('%Y%m%d_%H%M%S')}.jpg"
+                f"temp_story_{now_tz().strftime('%Y%m%d_%H%M%S')}.{ext}"
             )
             await file.download_to_drive(path)
             return path
         
-        image_path = loop.run_until_complete(download_file())
+        media_path = loop.run_until_complete(download_file())
         loop.close()
         
         # Connexion Instagram
@@ -337,30 +340,36 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         # Publication sur Instagram
         to_close_friends = story.get("to_close_friends", False)
         
-        # Paramètres additionnels pour la story
-        extra_data = {}
-        if to_close_friends:
-            # Liste des user IDs des amis proches (besoin de les récupérer d'abord)
-            try:
-                besties = cl.close_friend_list()
-                if besties:
-                    extra_data["audience"] = "besties"
-                    logging.info("📌 Story sera publiée pour les amis proches uniquement")
-            except Exception as e:
-                logging.warning("Impossible de récupérer la liste d'amis proches: %s", e)
-        
-        cl.photo_upload_to_story(image_path, extra_data=extra_data)
+        # Publication selon le type de média avec gestion amis proches
+        if media_type == "video":
+            if to_close_friends:
+                # Pour les amis proches, utiliser thread_ids="CLOSE_FRIENDS"
+                cl.video_upload_to_story(media_path, thread_ids="CLOSE_FRIENDS")
+                logging.info("🎬 Vidéo publiée sur Instagram (Amis proches uniquement)")
+            else:
+                cl.video_upload_to_story(media_path)
+                logging.info("🎬 Vidéo publiée sur Instagram")
+        else:
+            if to_close_friends:
+                # Pour les amis proches, utiliser thread_ids="CLOSE_FRIENDS"
+                cl.photo_upload_to_story(media_path, thread_ids="CLOSE_FRIENDS")
+                logging.info("📸 Photo publiée sur Instagram (Amis proches uniquement)")
+            else:
+                cl.photo_upload_to_story(media_path)
+                logging.info("📸 Photo publiée sur Instagram")
         
         # Mise à jour du statut
         db.update_story_status(story_id, "PUBLISHED")
         
         # Notification de succès (API Telegram synchrone)
+        media_icon = "🎬" if media_type == "video" else "📸"
+        media_name = "Vidéo" if media_type == "video" else "Photo"
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                 json={
                     "chat_id": chat_id,
-                    "text": "✅ Story publiée avec succès sur Instagram !"
+                    "text": f"✅ {media_name} publiée avec succès sur Instagram ! {media_icon}"
                 },
                 timeout=10
             )
@@ -387,10 +396,10 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
     
     finally:
         # Nettoyer le fichier temporaire
-        if image_path and os.path.exists(image_path):
+        if media_path and os.path.exists(media_path):
             try:
-                os.remove(image_path)
-                logging.info("🗑️ Fichier temporaire supprimé: %s", image_path)
+                os.remove(media_path)
+                logging.info("🗑️ Fichier temporaire supprimé: %s", media_path)
             except Exception as e:
                 logging.warning("Impossible de supprimer le fichier temporaire: %s", e)
 
@@ -461,10 +470,10 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             time_str = "en cours..."
         
-        message += f"{idx}. 📅 {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
-        message += f"   ⏰ {time_str}\n"
-        
-        # Afficher l'audience si amis proches
+            # Icône selon le type de média
+            media_icon = "🎬" if story.get("media_type") == "video" else "📸"
+            
+            message += f"{idx}. {media_icon} {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
         if story.get("to_close_friends"):
             message += f"   ✨ Amis proches\n"
         
@@ -483,38 +492,108 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=reply_markup
     )
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Gestionnaire de réception de photos.
+    Gestionnaire de réception de photos, vidéos et documents (pour qualité max).
     
-    Stocke l'ID du fichier photo sans téléchargement pour économiser l'espace disque.
+    Stocke l'ID du fichier photo/vidéo/document sans téléchargement pour économiser l'espace disque.
     """
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
+    media_type = None
+    file_id = None
+    file_size = None
+    quality_warning = ""
+    media_icon = ""
     
-    # Vérifier la taille de la photo
-    if photo.file_size and photo.file_size > 10 * 1024 * 1024:  # 10 MB
+    # Support photo compressée
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+        file_size = photo.file_size
+        media_type = "photo"
+        quality_warning = "⚠️ Photo compressée par Telegram. Envoie en tant que *document* pour qualité maximale."
+        media_icon = "📸"
+        max_size = 20 * 1024 * 1024  # 20 MB
+    
+    # Support vidéo compressée
+    elif update.message.video:
+        video = update.message.video
+        file_id = video.file_id
+        file_size = video.file_size
+        duration = video.duration
+        media_type = "video"
+        media_icon = "🎬"
+        max_size = 100 * 1024 * 1024  # 100 MB
+        
+        # Vérifier la durée (Instagram Stories max 60s)
+        if duration and duration > 60:
+            await update.message.reply_text(
+                f"⚠️ Vidéo trop longue ({duration}s).\n"
+                "Instagram Stories limite les vidéos à 60 secondes.\n"
+                "Envoie une vidéo plus courte."
+            )
+            return
+        
+        quality_warning = f"✅ Vidéo reçue ({duration}s) - prête pour publication !"
+    
+    # Support document (image ou vidéo non compressée)
+    elif update.message.document:
+        doc = update.message.document
+        file_id = doc.file_id
+        file_size = doc.file_size
+        
+        # Vérifier que c'est bien une image ou vidéo
+        if not doc.mime_type:
+            await update.message.reply_text(
+                "⚠️ Type de fichier non reconnu. Envoie une photo ou vidéo."
+            )
+            return
+        
+        if doc.mime_type.startswith('image/'):
+            media_type = "photo"
+            quality_warning = "✅ Document reçu - qualité originale préservée !"
+            media_icon = "📸"
+            max_size = 20 * 1024 * 1024  # 20 MB
+        elif doc.mime_type.startswith('video/'):
+            media_type = "video"
+            quality_warning = "✅ Vidéo document reçue - qualité maximale !"
+            media_icon = "🎬"
+            max_size = 100 * 1024 * 1024  # 100 MB
+        else:
+            await update.message.reply_text(
+                "⚠️ Ce n'est pas une image ou vidéo. Envoie un média valide."
+            )
+            return
+    else:
+        return
+    
+    # Vérifier la taille du fichier
+    if file_size and file_size > max_size:
+        max_mb = max_size // (1024 * 1024)
         await update.message.reply_text(
-            "⚠️ La photo est trop volumineuse (max 10 MB).\n"
-            "Envoie une photo plus légère."
+            f"⚠️ Le fichier est trop volumineux (max {max_mb} MB).\n"
+            "Envoie un fichier plus léger."
         )
         return
     
-    # Stocker uniquement l'ID du fichier Telegram
-    context.user_data['current_photo_file_id'] = file_id
-    context.user_data['photo_timestamp'] = now_tz()
+    # Stocker les informations du média
+    context.user_data['current_media_file_id'] = file_id
+    context.user_data['current_media_type'] = media_type
+    context.user_data['media_timestamp'] = now_tz()
     
     keyboard = [
         [
             InlineKeyboardButton("👥 Tout le monde", callback_data="audience_everyone"),
             InlineKeyboardButton("✨ Amis proches", callback_data="audience_close_friends")
         ],
-        [InlineKeyboardButton("❌ Annuler", callback_data="cancel_photo")]
+        [InlineKeyboardButton("❌ Annuler", callback_data="cancel_media")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    media_name = "Photo" if media_type == "photo" else "Vidéo"
+    
     await update.message.reply_text(
-        "📸 *Photo reçue avec succès !*\n\n"
+        f"{media_icon} *{media_name} reçue avec succès !*\n\n"
+        f"{quality_warning}\n\n"
         "👥 *Qui peut voir cette story ?*\n"
         "• Tout le monde - Visible par tous tes abonnés\n"
         "• Amis proches - Uniquement ta liste d'amis proches\n\n"
@@ -524,13 +603,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestionnaire de la commande /cancel - Annule la saisie en cours."""
-    if 'current_photo_file_id' in context.user_data:
-        context.user_data.pop('current_photo_file_id', None)
-        context.user_data.pop('photo_timestamp', None)
+    if 'current_media_file_id' in context.user_data:
+        context.user_data.pop('current_media_file_id', None)
+        context.user_data.pop('current_media_type', None)
+        context.user_data.pop('media_timestamp', None)
         await update.message.reply_text(
             "❌ *Programmation annulée*\n\n"
-            "La photo en attente a été supprimée.\n"
-            "Envoie une nouvelle photo pour recommencer.",
+            "Le média en attente a été supprimé.\n"
+            "Envoie une nouvelle photo ou vidéo pour recommencer.",
             parse_mode="Markdown"
         )
     else:
@@ -546,10 +626,11 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     Parse l'heure ou date/heure fournie et planifie la publication de la story.
     """
     time_str = update.message.text.strip()
-    file_id = context.user_data.get('current_photo_file_id')
+    file_id = context.user_data.get('current_media_file_id')
+    media_type = context.user_data.get('current_media_type', 'photo')
 
     if not file_id:
-        await update.message.reply_text("❌ Envoie d'abord une photo !")
+        await update.message.reply_text("❌ Envoie d'abord une photo ou vidéo !")
         return
 
     now = now_tz()
@@ -575,7 +656,8 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         chat_id=update.effective_chat.id,
         file_id=file_id,
         scheduled_time=run_date,
-        to_close_friends=to_close_friends
+        to_close_friends=to_close_friends,
+        media_type=media_type
     )
     
     if not story:
@@ -584,8 +666,9 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    context.user_data.pop('current_photo_file_id', None)
-    context.user_data.pop('photo_timestamp', None)
+    context.user_data.pop('current_media_file_id', None)
+    context.user_data.pop('current_media_type', None)
+    context.user_data.pop('media_timestamp', None)
     context.user_data.pop('to_close_friends', None)
     
     time_until = run_date - now_tz()
@@ -593,6 +676,8 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     minutes = int((time_until.total_seconds() % 3600) // 60)
     
     audience_text = "✨ Amis proches uniquement" if to_close_friends else "👥 Tout le monde"
+    media_icon = "🎬" if media_type == "video" else "📸"
+    media_name = "Vidéo" if media_type == "video" else "Photo"
     
     keyboard = [
         [InlineKeyboardButton("📋 Voir mes publications", callback_data="list_posts")],
@@ -601,7 +686,8 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"✅ *Publication programmée avec succès !*\n\n"
+        f"✅ *{media_name} programmée avec succès !*\n\n"
+        f"{media_icon} Type : {media_name}\n"
         f"📅 Date : {run_date.strftime('%d/%m/%Y à %H:%M')}{day_info}\n"
         f"⏰ Dans : {hours}h {minutes}min\n"
         f"👁️ Audience : {audience_text}\n\n"
@@ -731,7 +817,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 time_str = "en cours..."
             
-            message += f"{idx}. 📅 {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
+            # Icône selon le type de média
+            media_icon = "🎬" if story.get("media_type") == "video" else "📸"
+            
+            message += f"{idx}. {media_icon} {scheduled_local.strftime('%d/%m/%Y à %H:%M')}\n"
             message += f"   ⏰ {time_str}\n"
             
             # Afficher l'audience si amis proches
@@ -757,9 +846,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Afficher l'aide
         await query.message.reply_text(
             "📖 *Guide d'utilisation*\n\n"
-            "*📸 Programmer une story :*\n"
-            "1. Envoie une photo (max 10 MB)\n"
-            "2. Indique la date/heure de publication\n\n"
+            "*📸🎬 Programmer une story :*\n"
+            "1. Envoie une photo (max 20 MB) ou vidéo (max 100 MB, 60s max)\n"
+            "2. Choisis l'audience (tout le monde / amis proches)\n"
+            "3. Indique la date/heure de publication\n\n"
             "*⏰ Formats acceptés :*\n"
             "• `14:30` - Aujourd'hui à 14h30\n"
             "• `25/12 09:00` - Le 25 déc à 9h\n"
@@ -777,11 +867,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown"
         )
     
-    elif query.data == "cancel_photo":
-        context.user_data.pop('current_photo_file_id', None)
-        context.user_data.pop('photo_timestamp', None)
+    elif query.data == "cancel_media":
+        context.user_data.pop('current_media_file_id', None)
+        context.user_data.pop('current_media_type', None)
+        context.user_data.pop('media_timestamp', None)
         await query.message.edit_text(
-            "❌ Photo annulée. Envoie une nouvelle photo pour recommencer."
+            "❌ Média annulé. Envoie une nouvelle photo ou vidéo pour recommencer."
         )
     
     elif query.data.startswith("cancel_"):
@@ -803,9 +894,10 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Gestionnaire de la commande /help - Affiche l'aide détaillée."""
     await update.message.reply_text(
         "📖 *Guide d'utilisation*\n\n"
-        "*📸 Programmer une story :*\n"
-        "1. Envoie une photo (max 10 MB)\n"
-        "2. Indique la date/heure de publication\n\n"
+        "*📸🎬 Programmer une story :*\n"
+        "1. Envoie une photo (max 20 MB) ou vidéo (max 100 MB, 60s max)\n"
+        "2. Choisis l'audience (tout le monde / amis proches)\n"
+        "3. Indique la date/heure de publication\n\n"
         "*⏰ Formats acceptés :*\n"
         "• `14:30` - Aujourd'hui à 14h30\n"
         "• `25/12 09:00` - Le 25 déc à 9h\n"
@@ -878,7 +970,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("code", handle_code))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.IMAGE | filters.Document.VIDEO, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_time))
 
     print("🤖 Bot démarré ! Envoie une photo sur Telegram.")

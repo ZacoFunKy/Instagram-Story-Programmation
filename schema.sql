@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS stories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     chat_id BIGINT NOT NULL,
     file_id TEXT NOT NULL,
+    media_type VARCHAR(10) NOT NULL DEFAULT 'photo',
     scheduled_time TIMESTAMPTZ NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     to_close_friends BOOLEAN NOT NULL DEFAULT FALSE,
@@ -10,7 +11,8 @@ CREATE TABLE IF NOT EXISTS stories (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     error_message TEXT,
     
-    CONSTRAINT valid_status CHECK (status IN ('PENDING', 'PUBLISHED', 'ERROR', 'CANCELLED'))
+    CONSTRAINT valid_status CHECK (status IN ('PENDING', 'PUBLISHED', 'ERROR', 'CANCELLED')),
+    CONSTRAINT valid_media_type CHECK (media_type IN ('photo', 'video'))
 );
 
 -- Index pour optimiser les requêtes fréquentes
