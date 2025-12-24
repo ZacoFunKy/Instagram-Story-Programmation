@@ -4,3 +4,5 @@ apscheduler==3.10.4
 Flask==3.0.0
 Pillow>=8.1.1
 python-dotenv==1.0.0
+supabase==2.3.4
+postgrest==0.16.0

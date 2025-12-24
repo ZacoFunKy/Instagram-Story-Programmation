@@ -4,13 +4,16 @@ import logging
 import os
 import threading
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from flask import Flask
 from instagrapi import Client
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+from db_manager import DBManager
 
 # Charger les variables d'environnement depuis .env (pour développement local)
 load_dotenv()
@@ -23,31 +26,42 @@ def _env_required(key: str) -> str:
     return value
 
 
-# --- TES INFOS ---
-TOKEN = _env_required("TOKEN")  # Dans Render: variable d'env
+# --- CONFIGURATION ---
+TOKEN = _env_required("TOKEN")
 IG_USER = _env_required("IG_USER")
 IG_PASS = _env_required("IG_PASS")
+SUPABASE_URL = _env_required("SUPABASE_URL")
+SUPABASE_KEY = _env_required("SUPABASE_KEY")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 SESSION_FILE = os.path.join(DOWNLOAD_DIR, "ig_session.json")
 HTTP_PORT = int(os.environ.get("PORT", "8000"))
 
+# Timezone - Utiliser la timezone de Paris pour éviter les décalages
+TIMEZONE = ZoneInfo("Europe/Paris")
+
 two_factor_code = None
 ig_lock = threading.Lock()
-scheduled_jobs: dict[str, dict] = {}  # {job_id: {chat_id, file_id, run_date, job}}
 
 # Configuration
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# Initialisation
 cl = Client()
 web = Flask(__name__)
+db = DBManager(SUPABASE_URL, SUPABASE_KEY)
 
 
 @web.route("/health")
 def health() -> tuple[dict[str, str], int]:
     """Endpoint de santé pour UptimeRobot/Render keep-alive."""
     return {"status": "ok"}, 200
+
+
+def now_tz() -> datetime:
+    """Retourne datetime actuel avec la timezone configurée."""
+    return datetime.now(TIMEZONE)
 
 
 def load_instagram_session() -> None:
@@ -75,7 +89,7 @@ def parse_run_date(text: str, now: datetime) -> tuple[datetime | None, bool]:
     
     Args:
         text: Chaîne au format HH:MM, JJ/MM HH:MM, JJ/MM/AAAA HH:MM ou AAAA-MM-JJ HH:MM
-        now: Datetime actuelle pour référence
+        now: Datetime actuelle avec timezone pour référence
     
     Returns:
         Tuple (datetime parsée ou None, booléen indiquant si date explicite)
@@ -92,13 +106,17 @@ def parse_run_date(text: str, now: datetime) -> tuple[datetime | None, bool]:
             dt = datetime.strptime(text, fmt)
             if fmt == "%d/%m %H:%M":
                 dt = dt.replace(year=now.year)
+            # Ajouter la timezone configurée
+            dt = dt.replace(tzinfo=TIMEZONE)
             return dt, explicit_date
         except ValueError:
             pass
 
     try:
         t = datetime.strptime(text, "%H:%M").time()
-        return datetime.combine(now.date(), t), False
+        # Combiner avec la date actuelle ET la timezone
+        dt = datetime.combine(now.date(), t, tzinfo=TIMEZONE)
+        return dt, False
     except ValueError:
         return None, False
 
@@ -122,29 +140,54 @@ def instagram_login(
     global two_factor_code
     with ig_lock:
         try:
+            # Si déjà connecté et pas de force, retourner True
             if not force and cl.user_id:
                 return True
 
+            # Essayer de charger la session d'abord
+            if os.path.exists(SESSION_FILE) and not force:
+                try:
+                    cl.load_settings(SESSION_FILE)
+                    cl.login(IG_USER, IG_PASS)
+                    logging.info("✅ Connexion Instagram via session sauvegardée")
+                    return True
+                except Exception as session_exc:
+                    logging.warning("Impossible de réutiliser la session: %s", session_exc)
+
+            # Connexion normale avec 2FA si nécessaire
             cl.login(IG_USER, IG_PASS, verification_code=two_factor_code)
             two_factor_code = None
             save_instagram_session()
+            logging.info("✅ Connexion Instagram réussie")
             return True
+            
         except Exception as exc:
             msg = str(exc)
             logging.error("Connexion Instagram échouée: %s", msg)
 
-            if "Two-factor" in msg or "verification_code" in msg:
+            if "Two-factor" in msg or "verification_code" in msg or "challenge_required" in msg:
                 if context and chat_id:
-                    context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "🔐 Instagram demande un code 2FA. "
-                            "Envoie /code 123456 pour transmettre le code reçu par SMS/app."
-                        ),
+                    asyncio.create_task(
+                        context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                "🔐 *Code 2FA requis*\n\n"
+                                "Instagram demande un code d'authentification.\n"
+                                "📱 Ouvre ton **Google Authenticator** et copie le code à 6 chiffres.\n\n"
+                                "💡 Utilise : `/code 123456`\n"
+                                "(Remplace par le code de ton app)"
+                            ),
+                            parse_mode="Markdown"
+                        )
                     )
             else:
                 if context and chat_id:
-                    context.bot.send_message(chat_id=chat_id, text=f"❌ Login Instagram impossible: {msg}")
+                    asyncio.create_task(
+                        context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ Connexion Instagram impossible: {msg}"
+                        )
+                    )
             return False
 
 # Dossier pour stocker les images
@@ -152,70 +195,124 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 load_instagram_session()
 
-def post_story_job(file_id: str, chat_id: int, bot, job_id: str) -> None:
+
+def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
     """
-    Tâche planifiée pour publier une story Instagram.
+    Publie une story depuis les données de la base de données.
     
     Args:
-        file_id: ID du fichier Telegram à télécharger
-        chat_id: ID du chat Telegram pour notifications
-        bot: Instance du bot Telegram
-        job_id: ID unique du job pour le suivi
+        story: Dictionnaire contenant les données de la story depuis Supabase
+        bot_instance: Instance du bot Telegram pour les notifications
     """
-    logging.info("⏰ Il est l'heure ! Téléchargement et publication de la photo...")
+    story_id = story["id"]
+    file_id = story["file_id"]
+    chat_id = story["chat_id"]
     
-    # Supprimer de la liste des jobs programmés
-    scheduled_jobs.pop(job_id, None)
+    logging.info("📤 Publication de la story %s pour le chat %s", story_id, chat_id)
     
     image_path = None
     try:
-        # Télécharger l'image juste avant de poster
+        # Télécharger l'image depuis Telegram
         import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         async def download_file():
-            from telegram import Bot
-            temp_bot = Bot(token=TOKEN)
-            file = await temp_bot.get_file(file_id)
-            path = os.path.join(DOWNLOAD_DIR, f"temp_story_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+            file = await bot_instance.get_file(file_id)
+            path = os.path.join(
+                DOWNLOAD_DIR,
+                f"temp_story_{now_tz().strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
             await file.download_to_drive(path)
             return path
         
         image_path = loop.run_until_complete(download_file())
         loop.close()
         
+        # Connexion Instagram
         if not instagram_login(chat_id, None):
-            logging.warning("Publication annulée: connexion Instagram manquante")
-            bot.send_message(chat_id=chat_id, text="❌ Publication annulée: connexion Instagram manquante")
+            error_msg = "Connexion Instagram impossible"
+            logging.warning(error_msg)
+            db.update_story_status(story_id, "ERROR", error_msg)
+            bot_instance.send_message(
+                chat_id=chat_id,
+                text=f"❌ Publication annulée: {error_msg}"
+            )
             return
 
+        # Publication sur Instagram
         cl.photo_upload_to_story(image_path)
-        bot.send_message(chat_id=chat_id, text="✅ Story publiée avec succès !")
-        logging.info("Story publiée")
+        
+        # Mise à jour du statut
+        db.update_story_status(story_id, "PUBLISHED")
+        
+        # Notification de succès
+        bot_instance.send_message(
+            chat_id=chat_id,
+            text="✅ Story publiée avec succès sur Instagram !"
+        )
+        logging.info("✅ Story %s publiée avec succès", story_id)
         
     except Exception as exc:
-        logging.exception("Erreur lors de la publication de la story")
-        bot.send_message(chat_id=chat_id, text=f"❌ Erreur lors de la publication: {exc}")
+        error_msg = str(exc)
+        logging.exception("❌ Erreur lors de la publication de la story %s", story_id)
+        db.update_story_status(story_id, "ERROR", error_msg)
+        
+        try:
+            bot_instance.send_message(
+                chat_id=chat_id,
+                text=f"❌ Erreur lors de la publication: {error_msg}"
+            )
+        except Exception as notify_exc:
+            logging.error("Impossible d'envoyer la notification d'erreur: %s", notify_exc)
+    
     finally:
         # Nettoyer le fichier temporaire
         if image_path and os.path.exists(image_path):
             try:
                 os.remove(image_path)
-                logging.info("Fichier temporaire supprimé: %s", image_path)
+                logging.info("🗑️ Fichier temporaire supprimé: %s", image_path)
             except Exception as e:
                 logging.warning("Impossible de supprimer le fichier temporaire: %s", e)
+
+
+def check_and_publish_stories() -> None:
+    """
+    Worker qui vérifie périodiquement les stories à publier.
+    Appelé toutes les 60 secondes par APScheduler.
+    """
+    try:
+        pending_stories = db.get_pending_stories()
+        
+        if not pending_stories:
+            logging.debug("Aucune story à publier pour le moment")
+            return
+        
+        logging.info("🔍 %d story(ies) à publier trouvée(s)", len(pending_stories))
+        
+        # Créer une instance du bot pour les notifications
+        bot_instance = Bot(token=TOKEN)
+        
+        for story in pending_stories:
+            try:
+                publish_story_from_db(story, bot_instance)
+            except Exception as exc:
+                logging.error(
+                    "Erreur lors du traitement de la story %s: %s",
+                    story.get("id"),
+                    exc
+                )
+                
+    except Exception as exc:
+        logging.error("Erreur dans le worker de publication: %s", exc)
 
 
 # --- GESTION TELEGRAM ---
 async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestionnaire de la commande /list - Affiche les publications programmées."""
-    user_jobs = [
-        (job_id, info) for job_id, info in scheduled_jobs.items()
-        if info['chat_id'] == update.effective_chat.id
-    ]
+    user_stories = db.get_user_pending_stories(update.effective_chat.id)
     
-    if not user_jobs:
+    if not user_stories:
         keyboard = [
             [InlineKeyboardButton("📸 Programmer une story", callback_data="new_post")]
         ]
@@ -232,9 +329,9 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     message = "📋 *Publications programmées :*\n\n"
     keyboard = []
     
-    for idx, (job_id, info) in enumerate(user_jobs, 1):
-        run_date = info['run_date']
-        time_until = run_date - datetime.now()
+    for idx, story in enumerate(user_stories, 1):
+        scheduled_time = datetime.fromisoformat(story["scheduled_time"].replace("Z", "+00:00"))
+        time_until = scheduled_time - now_tz()
         
         if time_until.total_seconds() > 0:
             hours = int(time_until.total_seconds() // 3600)
@@ -243,11 +340,11 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             time_str = "en cours..."
         
-        message += f"{idx}. 📅 {run_date.strftime('%d/%m/%Y à %H:%M')}\n"
+        message += f"{idx}. 📅 {scheduled_time.strftime('%d/%m/%Y à %H:%M')}\n"
         message += f"   ⏰ {time_str}\n\n"
         
         keyboard.append([
-            InlineKeyboardButton(f"❌ Annuler #{idx}", callback_data=f"cancel_{job_id}")
+            InlineKeyboardButton(f"❌ Annuler #{idx}", callback_data=f"cancel_{story['id']}")
         ])
     
     keyboard.append([InlineKeyboardButton("🔄 Actualiser", callback_data="list_posts")])
@@ -278,7 +375,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     # Stocker uniquement l'ID du fichier Telegram
     context.user_data['current_photo_file_id'] = file_id
-    context.user_data['photo_timestamp'] = datetime.now()
+    context.user_data['photo_timestamp'] = now_tz()
     
     keyboard = [
         [InlineKeyboardButton("❌ Annuler", callback_data="cancel_photo")]
@@ -325,7 +422,7 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ Envoie d'abord une photo !")
         return
 
-    now = datetime.now()
+    now = now_tz()
     run_date, explicit_date = parse_run_date(time_str, now)
     if not run_date:
         await update.message.reply_text(
@@ -342,29 +439,23 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         day_info = ""
 
-    # Créer un ID unique pour ce job
-    job_id = f"{update.effective_chat.id}_{int(run_date.timestamp())}"
-    
-    job = scheduler.add_job(
-        post_story_job,
-        'date',
-        run_date=run_date,
-        args=[file_id, update.effective_chat.id, context.bot, job_id],
-        id=job_id
+    # Créer la story dans la base de données
+    story = db.create_story(
+        chat_id=update.effective_chat.id,
+        file_id=file_id,
+        scheduled_time=run_date
     )
     
-    # Sauvegarder dans le dictionnaire de tracking
-    scheduled_jobs[job_id] = {
-        'chat_id': update.effective_chat.id,
-        'file_id': file_id,
-        'run_date': run_date,
-        'job': job
-    }
+    if not story:
+        await update.message.reply_text(
+            "❌ Erreur lors de la programmation. Réessaie ou contacte le support."
+        )
+        return
 
     context.user_data.pop('current_photo_file_id', None)
     context.user_data.pop('photo_timestamp', None)
     
-    time_until = run_date - datetime.now()
+    time_until = run_date - now_tz()
     hours = int(time_until.total_seconds() // 3600)
     minutes = int((time_until.total_seconds() % 3600) // 60)
     
@@ -389,13 +480,18 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     is_logged = bool(cl.user_id)
     session_exists = os.path.exists(SESSION_FILE)
     
+    # Récupérer les stats depuis la BDD
+    stats = db.get_user_stats(update.effective_chat.id)
+    
     status_icon = "✅" if is_logged else "❌"
     status_text = "Connecté" if is_logged else "Non connecté"
     
     message = f"📊 *État du bot*\n\n"
     message += f"{status_icon} Instagram : {status_text}\n"
     message += f"💾 Session sauvegardée : {'✅ Oui' if session_exists else '❌ Non'}\n"
-    message += f"📅 Publications programmées : {len([j for j in scheduled_jobs.values() if j['chat_id'] == update.effective_chat.id])}\n\n"
+    message += f"📅 Publications programmées : {stats.get('pending_count', 0)}\n"
+    message += f"✅ Publications réussies : {stats.get('published_count', 0)}\n"
+    message += f"❌ Publications échouées : {stats.get('error_count', 0)}\n\n"
     
     if is_logged:
         message += "🟢 Le bot est prêt à publier tes stories !"
@@ -443,14 +539,76 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     
     elif query.data == "list_posts":
-        # Simuler la commande /list
-        update.message = query.message
-        await handle_list(update, context)
+        # Afficher les publications programmées
+        user_stories = db.get_user_pending_stories(query.message.chat_id)
+        
+        if not user_stories:
+            keyboard = [
+                [InlineKeyboardButton("📸 Programmer une story", callback_data="new_post")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_text(
+                "📭 *Aucune publication programmée*\n\n"
+                "Tu n'as pas encore de story en attente de publication.\n"
+                "Envoie-moi une photo pour commencer !",
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+            return
+        
+        message = "📋 *Publications programmées :*\n\n"
+        keyboard = []
+        
+        for idx, story in enumerate(user_stories, 1):
+            scheduled_time = datetime.fromisoformat(story["scheduled_time"].replace("Z", "+00:00"))
+            time_until = scheduled_time - now_tz()
+            
+            if time_until.total_seconds() > 0:
+                hours = int(time_until.total_seconds() // 3600)
+                minutes = int((time_until.total_seconds() % 3600) // 60)
+                time_str = f"dans {hours}h {minutes}min"
+            else:
+                time_str = "en cours..."
+            
+            message += f"{idx}. 📅 {scheduled_time.strftime('%d/%m/%Y à %H:%M')}\n"
+            message += f"   ⏰ {time_str}\n\n"
+            
+            keyboard.append([
+                InlineKeyboardButton(f"❌ Annuler #{idx}", callback_data=f"cancel_{story['id']}")
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔄 Actualiser", callback_data="list_posts")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.reply_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
     
     elif query.data == "help":
-        # Simuler la commande /help
-        update.message = query.message
-        await handle_help(update, context)
+        # Afficher l'aide
+        await query.message.reply_text(
+            "📖 *Guide d'utilisation*\n\n"
+            "*📸 Programmer une story :*\n"
+            "1. Envoie une photo (max 10 MB)\n"
+            "2. Indique la date/heure de publication\n\n"
+            "*⏰ Formats acceptés :*\n"
+            "• `14:30` - Aujourd'hui à 14h30\n"
+            "• `25/12 09:00` - Le 25 déc à 9h\n"
+            "• `25/12/2025 09:00` - Format complet\n"
+            "• `2025-12-25 09:00` - Format ISO\n\n"
+            "*🔐 Authentification 2FA :*\n"
+            "Si Instagram demande un code :\n"
+            "1. Ouvre ton app Google Authenticator\n"
+            "2. Utilise `/code 123456` (ton code à 6 chiffres)\n\n"
+            "*📋 Autres commandes :*\n"
+            "/list - Liste des publications programmées\n"
+            "/cancel - Annuler une publication\n"
+            "/status - État de la connexion Instagram\n\n"
+            "💬 Besoin d'aide ? Contacte @ZacoFunKy",
+            parse_mode="Markdown"
+        )
     
     elif query.data == "cancel_photo":
         context.user_data.pop('current_photo_file_id', None)
@@ -460,23 +618,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     
     elif query.data.startswith("cancel_"):
-        job_id = query.data.replace("cancel_", "")
-        if job_id in scheduled_jobs and scheduled_jobs[job_id]['chat_id'] == query.message.chat_id:
-            try:
-                scheduled_jobs[job_id]['job'].remove()
-                scheduled_jobs.pop(job_id)
-                await query.message.edit_text(
-                    "✅ *Publication annulée avec succès !*\n\n"
-                    "La story ne sera pas publiée.",
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                await query.message.edit_text(
-                    f"❌ Erreur lors de l'annulation : {e}"
-                )
+        story_id = query.data.replace("cancel_", "")
+        success = db.cancel_story(story_id, query.message.chat_id)
+        
+        if success:
+            await query.message.edit_text(
+                "✅ *Publication annulée avec succès !*\n\n"
+                "La story ne sera pas publiée.",
+                parse_mode="Markdown"
+            )
         else:
             await query.message.edit_text(
-                "⚠️ Cette publication n'existe plus ou a déjà été publiée."
+                "⚠️ Cette publication n'existe plus, a déjà été publiée, ou ne t'appartient pas."
             )
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -493,8 +646,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "• `2025-12-25 09:00` - Format ISO\n\n"
         "*🔐 Authentification 2FA :*\n"
         "Si Instagram demande un code :\n"
-        "1. Consulte ton app d'authentification\n"
-        "2. Utilise `/code 123456` (remplace par ton code)\n\n"
+        "1. Ouvre ton app **Google Authenticator**\n"
+        "2. Copie le code à 6 chiffres\n"
+        "3. Utilise `/code 123456` (remplace par ton code)\n\n"
         "*📋 Autres commandes :*\n"
         "/list - Liste des publications programmées\n"
         "/cancel - Annuler une publication\n"
@@ -538,6 +692,15 @@ def start_web_server() -> None:
 if __name__ == '__main__':
     # Lancer le petit serveur Flask pour UptimeRobot/Render keep-alive
     threading.Thread(target=start_web_server, daemon=True).start()
+    
+    # Lancer le worker de vérification des stories (toutes les 60 secondes)
+    scheduler.add_job(
+        check_and_publish_stories,
+        'interval',
+        seconds=60,
+        id='story_publisher_worker'
+    )
+    logging.info("🔄 Worker de publication démarré (vérification toutes les 60s)")
 
     app = ApplicationBuilder().token(TOKEN).build()
 
