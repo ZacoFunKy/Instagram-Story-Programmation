@@ -341,12 +341,11 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         to_close_friends = story.get("to_close_friends", False)
         
         # Récupérer les IDs des amis proches si nécessaire
-        story_recipients = None
+        story_recipients: list[str] | None = None
         if to_close_friends:
             try:
                 besties = cl.close_friend_list()
                 if besties:
-                    # Convertir en liste d'IDs pour l'API Instagram
                     story_recipients = [str(user.pk) for user in besties]
                     logging.info("📌 %d amis proches trouvés", len(story_recipients))
                 else:
@@ -355,20 +354,34 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
                 logging.error("❌ Erreur récupération amis proches: %s - Publication en mode public", e)
         
         # Publication selon le type de média
-        if media_type == "video":
-            if story_recipients:
-                cl.video_upload_to_story(media_path, to=story_recipients)
-                logging.info("🎬 Vidéo publiée pour %d amis proches", len(story_recipients))
+        try:
+            if media_type == "video":
+                if story_recipients:
+                    try:
+                        cl.video_upload_to_story(media_path, audience="besties")
+                        logging.info("🎬 Vidéo publiée (audience=besties)")
+                    except Exception as primary_err:
+                        logging.warning("Fallback besties->to: %s", primary_err)
+                        cl.video_upload_to_story(media_path, to=story_recipients)
+                        logging.info("🎬 Vidéo publiée pour %d amis proches", len(story_recipients))
+                else:
+                    cl.video_upload_to_story(media_path)
+                    logging.info("🎬 Vidéo publiée sur Instagram")
             else:
-                cl.video_upload_to_story(media_path)
-                logging.info("🎬 Vidéo publiée sur Instagram")
-        else:
-            if story_recipients:
-                cl.photo_upload_to_story(media_path, to=story_recipients)
-                logging.info("📸 Photo publiée pour %d amis proches", len(story_recipients))
-            else:
-                cl.photo_upload_to_story(media_path)
-                logging.info("📸 Photo publiée sur Instagram")
+                if story_recipients:
+                    try:
+                        cl.photo_upload_to_story(media_path, audience="besties")
+                        logging.info("📸 Photo publiée (audience=besties)")
+                    except Exception as primary_err:
+                        logging.warning("Fallback besties->to: %s", primary_err)
+                        cl.photo_upload_to_story(media_path, to=story_recipients)
+                        logging.info("📸 Photo publiée pour %d amis proches", len(story_recipients))
+                else:
+                    cl.photo_upload_to_story(media_path)
+                    logging.info("📸 Photo publiée sur Instagram")
+        except Exception as upload_err:
+            logging.error("❌ Erreur upload story: %s", upload_err)
+            raise
         
         # Mise à jour du statut
         db.update_story_status(story_id, "PUBLISHED")
