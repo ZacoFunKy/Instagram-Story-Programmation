@@ -61,10 +61,55 @@ def get_optimal_dimensions(width: int, height: int) -> Tuple[int, int]:
     return new_width, new_height
 
 
+def add_story_bars(img: Image.Image, background_color=(0, 0, 0)) -> Image.Image:
+    """
+    Ajoute des bandes (letterbox/pillarbox) pour forcer le ratio 9:16.
+    
+    Args:
+        img: Image PIL à traiter
+        background_color: Couleur des bandes (noir par défaut)
+    
+    Returns:
+        Image PIL avec ratio 9:16 parfait
+    """
+    width, height = img.size
+    aspect_ratio = height / width
+    
+    # Si déjà au bon ratio, ne rien faire
+    if abs(aspect_ratio - STORY_ASPECT_RATIO) < 0.01:
+        return img
+    
+    # Créer un canvas 9:16
+    if aspect_ratio > STORY_ASPECT_RATIO:
+        # Image trop haute -> bandes sur les côtés (pillarbox)
+        new_height = height
+        new_width = int(height / STORY_ASPECT_RATIO)
+    else:
+        # Image trop large -> bandes en haut/bas (letterbox)
+        new_width = width
+        new_height = int(width * STORY_ASPECT_RATIO)
+    
+    # Créer le canvas avec fond noir
+    canvas = Image.new('RGB', (new_width, new_height), background_color)
+    
+    # Centrer l'image originale
+    offset_x = (new_width - width) // 2
+    offset_y = (new_height - height) // 2
+    canvas.paste(img, (offset_x, offset_y))
+    
+    logger.info(
+        "Bandes ajoutées: %dx%d -> %dx%d (ratio %.2f -> %.2f)",
+        width, height, new_width, new_height, aspect_ratio, STORY_ASPECT_RATIO
+    )
+    
+    return canvas
+
+
 def compress_image(
     input_path: str,
     output_path: Optional[str] = None,
-    max_size_mb: float = MAX_FILE_SIZE_MB
+    max_size_mb: float = MAX_FILE_SIZE_MB,
+    add_bars: bool = True
 ) -> str:
     """
     Compresse une image pour Instagram Stories avec haute qualité.
@@ -73,6 +118,7 @@ def compress_image(
         input_path: Chemin de l'image source
         output_path: Chemin de sortie (optionnel, écrase l'original si None)
         max_size_mb: Taille max du fichier en MB
+        add_bars: Ajouter des bandes noires pour forcer le ratio 9:16
     
     Returns:
         Chemin du fichier compressé
@@ -100,16 +146,17 @@ def compress_image(
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
             
-            # Calculer les dimensions optimales
-            new_width, new_height = get_optimal_dimensions(img.width, img.height)
+            # Ajouter des bandes si nécessaire pour forcer 9:16
+            if add_bars:
+                img = add_story_bars(img)
             
-            # Redimensionner avec haute qualité (LANCZOS)
-            if (new_width, new_height) != (img.width, img.height):
+            # Redimensionner au format Instagram optimal (1080x1920)
+            if (img.width, img.height) != (STORY_WIDTH, STORY_HEIGHT):
                 logger.info(
-                    "Redimensionnement image: %dx%d -> %dx%d",
-                    img.width, img.height, new_width, new_height
+                    "Redimensionnement final: %dx%d -> %dx%d",
+                    img.width, img.height, STORY_WIDTH, STORY_HEIGHT
                 )
-                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                img = img.resize((STORY_WIDTH, STORY_HEIGHT), Image.Resampling.LANCZOS)
             
             # Sauvegarder avec qualité maximale
             save_kwargs = {

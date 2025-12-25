@@ -318,3 +318,224 @@ class DBManager:
         except Exception as exc:
             self.logger.error("Erreur lors du nettoyage: %s", exc)
             return 0
+
+    def get_stories_for_retry(self) -> list[dict]:
+        """
+        Récupère les stories en ERROR qui peuvent être retentées.
+        
+        Returns:
+            Liste des stories à retenter
+        """
+        try:
+            from datetime import timedelta
+            import config
+            
+            # Calculer les temps de retry basés sur retry_count
+            now = datetime.now(ZoneInfo("UTC"))
+            stories_to_retry = []
+            
+            # Récupérer toutes les stories en ERROR
+            result = self.client.table("stories")\
+                .select("*")\
+                .eq("status", "ERROR")\
+                .lte("retry_count", config.RETRY_MAX_ATTEMPTS - 1)\
+                .execute()
+            
+            if not result.data:
+                return []
+            
+            # Filtrer celles dont le délai de retry est écoulé
+            for story in result.data:
+                retry_count = story.get("retry_count", 0)
+                updated_at = datetime.fromisoformat(story["updated_at"].replace("Z", "+00:00"))
+                
+                # Calculer le délai de retry
+                retry_delay_minutes = config.get_retry_delay(retry_count)
+                next_retry_time = updated_at + timedelta(minutes=retry_delay_minutes)
+                
+                if now >= next_retry_time:
+                    stories_to_retry.append(story)
+            
+            return stories_to_retry
+            
+        except Exception as exc:
+            self.logger.error("Erreur lors de la récupération des stories à retenter: %s", exc)
+            return []
+
+    def get_user_pending_count(self, chat_id: int) -> int:
+        """
+        Compte le nombre de stories en attente pour un utilisateur.
+        
+        Args:
+            chat_id: ID du chat Telegram
+        
+        Returns:
+            Nombre de stories PENDING
+        """
+        try:
+            result = self.client.table("stories")\
+                .select("id", count="exact")\
+                .eq("chat_id", chat_id)\
+                .eq("status", "PENDING")\
+                .execute()
+            
+            return result.count if hasattr(result, 'count') else 0
+            
+        except Exception as exc:
+            self.logger.error("Erreur lors du comptage des stories: %s", exc)
+            return 0
+
+    def update_story(
+        self,
+        story_id: str,
+        scheduled_time: Optional[datetime] = None,
+        to_close_friends: Optional[bool] = None,
+        text_overlay: Optional[str] = None,
+        music_file_id: Optional[str] = None
+    ) -> bool:
+        """
+        Met à jour les paramètres d'une story programmée.
+        
+        Args:
+            story_id: UUID de la story
+            scheduled_time: Nouvelle heure de publication (optionnel)
+            to_close_friends: Nouvelle audience (optionnel)
+            text_overlay: Texte à superposer (optionnel)
+            music_file_id: ID du fichier audio (optionnel)
+        
+        Returns:
+            True si la mise à jour a réussi
+        """
+        try:
+            data = {
+                "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
+            }
+            
+            if scheduled_time:
+                scheduled_utc = scheduled_time.astimezone(ZoneInfo("UTC"))
+                data["scheduled_time"] = scheduled_utc.isoformat()
+            
+            if to_close_friends is not None:
+                data["to_close_friends"] = to_close_friends
+            
+            if text_overlay is not None:
+                data["text_overlay"] = text_overlay
+            
+            if music_file_id is not None:
+                data["music_file_id"] = music_file_id
+            
+            result = self.client.table("stories")\
+                .update(data)\
+                .eq("id", story_id)\
+                .execute()
+            
+            self.logger.info("Story %s mise à jour", story_id)
+            return bool(result.data)
+            
+        except Exception as exc:
+            self.logger.error("Erreur lors de la mise à jour de la story %s: %s", story_id, exc)
+            return False
+
+    def get_story_by_id(self, story_id: str) -> Optional[dict]:
+        """
+        Récupère une story par son ID.
+        
+        Args:
+            story_id: UUID de la story
+        
+        Returns:
+            Dictionnaire de la story ou None
+        """
+        try:
+            result = self.client.table("stories")\
+                .select("*")\
+                .eq("id", story_id)\
+                .execute()
+            
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return None
+            
+        except Exception as exc:
+            self.logger.error("Erreur lors de la récupération de la story %s: %s", story_id, exc)
+            return None
+
+    def get_advanced_stats(self, chat_id: int) -> dict:
+        """
+        Récupère des statistiques avancées pour un utilisateur.
+        
+        Args:
+            chat_id: ID du chat Telegram
+        
+        Returns:
+            Dictionnaire avec statistiques détaillées
+        """
+        try:
+            # Récupérer toutes les stories de l'utilisateur
+            result = self.client.table("stories")\
+                .select("*")\
+                .eq("chat_id", chat_id)\
+                .execute()
+            
+            if not result.data:
+                return {
+                    "total": 0,
+                    "success_rate": 0,
+                    "avg_delay_minutes": 0,
+                    "popular_times": [],
+                    "media_preferences": {"photo": 0, "video": 0}
+                }
+            
+            stories = result.data
+            total = len(stories)
+            published = [s for s in stories if s["status"] == "PUBLISHED"]
+            errors = [s for s in stories if s["status"] == "ERROR"]
+            
+            # Taux de succès
+            success_rate = (len(published) / total * 100) if total > 0 else 0
+            
+            # Délai moyen entre création et publication
+            delays = []
+            for story in published:
+                if story.get("published_at") and story.get("created_at"):
+                    created = datetime.fromisoformat(story["created_at"].replace("Z", "+00:00"))
+                    published_at = datetime.fromisoformat(story["published_at"].replace("Z", "+00:00"))
+                    delay_minutes = (published_at - created).total_seconds() / 60
+                    delays.append(delay_minutes)
+            
+            avg_delay = sum(delays) / len(delays) if delays else 0
+            
+            # Heures populaires (histogramme par heure)
+            hours_histogram = [0] * 24
+            for story in stories:
+                if story.get("scheduled_time"):
+                    scheduled = datetime.fromisoformat(story["scheduled_time"].replace("Z", "+00:00"))
+                    hours_histogram[scheduled.hour] += 1
+            
+            # Top 3 heures
+            popular_hours = sorted(
+                enumerate(hours_histogram),
+                key=lambda x: x[1],
+                reverse=True
+            )[:3]
+            popular_times = [f"{h:02d}h" for h, _ in popular_hours if _ > 0]
+            
+            # Préférences médias
+            media_preferences = {
+                "photo": sum(1 for s in stories if s.get("media_type") == "photo"),
+                "video": sum(1 for s in stories if s.get("media_type") == "video")
+            }
+            
+            return {
+                "total": total,
+                "published": len(published),
+                "errors": len(errors),
+                "success_rate": round(success_rate, 1),
+                "avg_delay_minutes": round(avg_delay, 1),
+                "popular_times": popular_times,
+                "media_preferences": media_preferences
+            }
+            
+        except Exception as exc:
+            self.logger.error("Erreur lors du calcul des stats avancées: %s", exc)
+            return {}

@@ -157,7 +157,7 @@ def process_quick_time_callback(
     callback_data: str,
     reference_time: datetime,
     timezone: ZoneInfo
-) -> Optional[datetime]:
+) -> dict:
     """
     Traite un callback de sélection rapide d'heure.
     
@@ -167,10 +167,18 @@ def process_quick_time_callback(
         timezone: Timezone à appliquer
     
     Returns:
-        Datetime calculé ou None si invalide
+        Dictionnaire avec:
+        - action: "scheduled", "cancel", "manual", ou "error"
+        - scheduled_time: datetime si action="scheduled"
     """
+    if callback_data == "cancel_media":
+        return {"action": "cancel"}
+    
+    if callback_data == "time_manual":
+        return {"action": "manual"}
+    
     if not callback_data.startswith("time_"):
-        return None
+        return {"action": "error"}
     
     time_value = callback_data.replace("time_", "")
     
@@ -178,9 +186,10 @@ def process_quick_time_callback(
     if time_value.startswith("+"):
         try:
             hours = int(time_value[1:-1])  # Extraire le chiffre
-            return reference_time + timedelta(hours=hours)
+            scheduled_time = reference_time + timedelta(hours=hours)
+            return {"action": "scheduled", "scheduled_time": scheduled_time}
         except:
-            return None
+            return {"action": "error"}
     
     # Demain
     elif time_value.startswith("tomorrow_"):
@@ -191,9 +200,9 @@ def process_quick_time_callback(
                 (reference_time + timedelta(days=1)).date(),
                 time_obj
             ).replace(tzinfo=timezone)
-            return dt
+            return {"action": "scheduled", "scheduled_time": dt}
         except:
-            return None
+            return {"action": "error"}
     
     # Heure spécifique aujourd'hui
     else:
@@ -205,9 +214,9 @@ def process_quick_time_callback(
             if dt <= reference_time:
                 dt += timedelta(days=1)
             
-            return dt
+            return {"action": "scheduled", "scheduled_time": dt}
         except:
-            return None
+            return {"action": "error"}
 
 
 def validate_scheduled_time(

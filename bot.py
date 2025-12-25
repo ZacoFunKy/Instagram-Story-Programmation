@@ -9,12 +9,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from flask import Flask
-from instagrapi import Client
 import requests
-try:
-    import pyotp  # Optional: for Google Authenticator TOTP
-except Exception:  # pragma: no cover
-    pyotp = None
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -27,6 +22,10 @@ from datetime_manager import (
     create_confirmation_message,
     get_datetime_help_text
 )
+from instagram_manager import InstagramManager, set_pending_2fa_code
+import config
+import media_validator
+import overlay_manager
 
 # Charger les variables d'environnement depuis .env (pour développement local)
 load_dotenv()
@@ -61,32 +60,29 @@ PROXY_URL = (
 # Timezone - Utiliser la timezone de Paris pour éviter les décalages
 TIMEZONE = ZoneInfo("Europe/Paris")
 
-two_factor_code = None
 ig_lock = threading.Lock()
 
-# Configuration
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Configuration du logging avec niveau du config
+log_level = getattr(logging, config.LOG_LEVEL, logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=log_level
+)
 scheduler = BackgroundScheduler()
 scheduler.start()
 
 # Initialisation
-cl = Client()
 web = Flask(__name__)
 db = DBManager(SUPABASE_URL, SUPABASE_KEY)
 
-# Configurer un proxy si fourni
-if PROXY_URL:
-    try:
-        cl.set_proxy(PROXY_URL)
-        logging.info("Proxy configuré pour Instagram API")
-    except Exception as e:
-        logging.warning("Impossible de configurer le proxy: %s", e)
-
-# Ralentir les requêtes pour paraître plus humain
-try:
-    cl.delay_range = [1, 3]
-except Exception:
-    pass
+# Initialiser le gestionnaire Instagram
+ig_manager = InstagramManager(
+    username=IG_USER,
+    password=IG_PASS,
+    session_file=SESSION_FILE,
+    totp_secret=IG_TOTP_SECRET,
+    proxy_url=PROXY_URL
+)
 
 
 @web.route("/health")
@@ -100,156 +96,8 @@ def now_tz() -> datetime:
     return datetime.now(TIMEZONE)
 
 
-def load_instagram_session() -> None:
-    """Charger une session Instagram existante depuis le disque."""
-    if os.path.exists(SESSION_FILE):
-        try:
-            cl.load_settings(SESSION_FILE)
-            if PROXY_URL:
-                cl.set_proxy(PROXY_URL)
-            logging.info("Session Instagram chargée depuis le disque")
-        except Exception as exc:
-            logging.warning("Impossible de charger la session Instagram: %s", exc)
-
-
-def save_instagram_session() -> None:
-    """Sauvegarder la session Instagram sur le disque."""
-    try:
-        cl.dump_settings(SESSION_FILE)
-        logging.info("Session Instagram sauvegardée")
-    except Exception as exc:
-        logging.warning("Sauvegarde de la session Instagram impossible: %s", exc)
-
-
-def instagram_login(
-    chat_id: int | None = None,
-    context: ContextTypes.DEFAULT_TYPE | None = None,
-    force: bool = False
-) -> bool:
-    """
-    Connexion Instagram avec gestion du 2FA et de la session.
-    
-    Args:
-        chat_id: ID du chat Telegram pour notifications (optionnel)
-        context: Contexte Telegram pour envoyer des messages (optionnel)
-        force: Forcer la reconnexion même si déjà connecté
-    
-    Returns:
-        True si connexion réussie, False sinon
-    """
-    global two_factor_code
-    with ig_lock:
-        try:
-            # Si déjà connecté et pas de force, retourner True
-            if not force and cl.user_id:
-                return True
-
-            # Option 1: login par sessionid (bypasse mot de passe/2FA)
-            if IG_SESSIONID:
-                try:
-                    cl.login_by_sessionid(IG_SESSIONID)
-                    save_instagram_session()
-                    logging.info("✅ Connexion Instagram via sessionid")
-                    return True
-                except Exception as sessionid_exc:
-                    logging.warning("Echec login sessionid: %s", sessionid_exc)
-
-            # Essayer de charger la session d'abord
-            if os.path.exists(SESSION_FILE) and not force:
-                try:
-                    cl.load_settings(SESSION_FILE)
-                    cl.login(IG_USER, IG_PASS)
-                    logging.info("✅ Connexion Instagram via session sauvegardée")
-                    return True
-                except Exception as session_exc:
-                    logging.warning("Impossible de réutiliser la session: %s", session_exc)
-
-            # Connexion normale avec 2FA si nécessaire
-            # Générer un code TOTP si secret fourni et aucun code /code en attente
-            code_to_use = two_factor_code
-            used_totp = False
-            if not code_to_use and IG_TOTP_SECRET and pyotp:
-                try:
-                    sanitized_secret = IG_TOTP_SECRET.replace(" ", "").strip().upper()
-                    code_to_use = pyotp.TOTP(sanitized_secret).now()
-                    used_totp = True
-                    logging.info("Code TOTP généré automatiquement pour 2FA")
-                except Exception as e:
-                    logging.warning("Impossible de générer le TOTP: %s", e)
-
-            try:
-                cl.login(IG_USER, IG_PASS, verification_code=code_to_use)
-            except Exception as first_exc:
-                # Si le code 2FA semble invalide et qu'on utilise TOTP, retenter une seule fois
-                msg1 = str(first_exc).lower()
-                if used_totp and (
-                    "code" in msg1 or "two-factor" in msg1 or "verification" in msg1
-                ) and IG_TOTP_SECRET and pyotp:
-                    try:
-                        sanitized_secret = IG_TOTP_SECRET.replace(" ", "").strip().upper()
-                        new_code = pyotp.TOTP(sanitized_secret).now()
-                        logging.info("Retry login avec un nouveau TOTP")
-                        cl.login(IG_USER, IG_PASS, verification_code=new_code)
-                    except Exception:
-                        raise first_exc
-                else:
-                    raise first_exc
-            two_factor_code = None
-            save_instagram_session()
-            logging.info("✅ Connexion Instagram réussie")
-            return True
-            
-        except Exception as exc:
-            msg = str(exc)
-            logging.error("Connexion Instagram échouée: %s", msg)
-
-            if "Two-factor" in msg or "verification_code" in msg or "challenge_required" in msg:
-                if context and chat_id:
-                    # Programmer l'envoi sur la boucle de l'application Telegram
-                    context.application.create_task(
-                        context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                "🔐 *Code 2FA requis*\n\n"
-                                "Instagram demande un code d'authentification.\n"
-                                "📱 Ouvre ton **Google Authenticator** et copie le code à 6 chiffres.\n\n"
-                                "💡 Utilise : `/code 123456`\n"
-                                "(Remplace par le code de ton app)"
-                            ),
-                            parse_mode="Markdown"
-                        )
-                    )
-            elif "blacklist" in msg.lower() or "bad password" in msg.lower():
-                # IP Render blacklistée ou mot de passe refusé côté serveur
-                help_text = (
-                    "❌ Connexion refusée par Instagram.\n\n"
-                    "Causes probables :\n"
-                    "• IP du serveur bloquée (blacklist)\n"
-                    "• Mot de passe refusé\n\n"
-                    "Solutions :\n"
-                    "1) Faire une 1ère connexion en local (2FA) pour créer la session,\n"
-                    "   puis copier `ig_session.json` vers `/data` sur Render.\n"
-                    "2) Fournir `IG_SESSIONID` (cookie session) dans les variables d'environnement.\n"
-                    "3) Configurer un proxy propre via `PROXY_URL`."
-                )
-                if context and chat_id:
-                    context.application.create_task(
-                        context.bot.send_message(chat_id=chat_id, text=help_text)
-                    )
-            else:
-                if context and chat_id:
-                    context.application.create_task(
-                        context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"❌ Connexion Instagram impossible: {msg}"
-                        )
-                    )
-            return False
-
 # Dossier pour stocker les images
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-load_instagram_session()
 
 
 def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
@@ -285,8 +133,6 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
     try:
         # Télécharger le média depuis Telegram
         import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         
         async def download_file():
             file = await bot_instance.get_file(file_id)
@@ -299,11 +145,24 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
             await file.download_to_drive(path)
             return path
         
-        media_path = loop.run_until_complete(download_file())
-        loop.close()
+        # Gérer l'event loop de manière robuste
+        try:
+            # Essayer d'obtenir l'event loop existant
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                # Si le loop est fermé, en créer un nouveau
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            # Pas d'event loop, en créer un nouveau
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         
-        # Connexion Instagram
-        if not instagram_login(chat_id, None):
+        # Exécuter le téléchargement sans fermer le loop
+        media_path = loop.run_until_complete(download_file())
+        
+        # Connexion Instagram (synchrone car appelé depuis le scheduler)
+        if not loop.run_until_complete(ig_manager.login(chat_id=None, context=None, force=False)):
             error_msg = "Connexion Instagram impossible"
             logging.warning(error_msg)
             db.update_story_status(
@@ -339,29 +198,31 @@ def publish_story_from_db(story: dict, bot_instance: Bot) -> None:
         logging.info("Publication story - Audience: %s", 
                     "Amis proches" if to_close_friends else "Public")
         
-        # Publication selon le type de média
+        # Publication selon le type de média (avec lock pour thread safety)
         media_response = None
         try:
-            if media_type == "video":
-                if to_close_friends:
-                    logging.info("🎬 Publication vidéo pour amis proches...")
-                    # Audience close friends via extra_data
-                    extra_data = {"audience": "besties"}
-                    media_response = cl.video_upload_to_story(media_path, extra_data=extra_data)
-                    logging.info("🎬 Vidéo publiée pour amis proches ✨")
+            with ig_lock:
+                client = ig_manager.get_client()
+                if media_type == "video":
+                    if to_close_friends:
+                        logging.info("🎬 Publication vidéo pour amis proches...")
+                        # Audience close friends via extra_data
+                        extra_data = {"audience": "besties"}
+                        media_response = client.video_upload_to_story(media_path, extra_data=extra_data)
+                        logging.info("🎬 Vidéo publiée pour amis proches ✨")
+                    else:
+                        media_response = client.video_upload_to_story(media_path)
+                        logging.info("🎬 Vidéo publiée sur Instagram")
                 else:
-                    media_response = cl.video_upload_to_story(media_path)
-                    logging.info("🎬 Vidéo publiée sur Instagram")
-            else:
-                if to_close_friends:
-                    logging.info("📸 Publication photo pour amis proches...")
-                    # Audience close friends via extra_data
-                    extra_data = {"audience": "besties"}
-                    media_response = cl.photo_upload_to_story(media_path, extra_data=extra_data)
-                    logging.info("📸 Photo publiée pour amis proches ✨")
-                else:
-                    media_response = cl.photo_upload_to_story(media_path)
-                    logging.info("📸 Photo publiée sur Instagram")
+                    if to_close_friends:
+                        logging.info("📸 Publication photo pour amis proches...")
+                        # Audience close friends via extra_data
+                        extra_data = {"audience": "besties"}
+                        media_response = client.photo_upload_to_story(media_path, extra_data=extra_data)
+                        logging.info("📸 Photo publiée pour amis proches ✨")
+                    else:
+                        media_response = client.photo_upload_to_story(media_path)
+                        logging.info("📸 Photo publiée sur Instagram")
         except Exception as upload_err:
             logging.error("❌ Erreur upload story: %s", upload_err)
             raise
@@ -469,11 +330,158 @@ def check_and_publish_stories() -> None:
                 logging.error(
                     "Erreur lors du traitement de la story %s: %s",
                     story.get("id"),
-                    exc
+                    exc,
+                    extra={
+                        "story_id": story.get("id"),
+                        "chat_id": story.get("chat_id"),
+                        "error": str(exc)
+                    }
                 )
                 
     except Exception as exc:
         logging.error("Erreur dans le worker de publication: %s", exc)
+
+
+def check_and_retry_stories() -> None:
+    """
+    Worker qui retente les stories en erreur avec système de retry intelligent.
+    Appelé toutes les 5 minutes par APScheduler.
+    """
+    if not config.RETRY_ENABLED:
+        return
+    
+    try:
+        stories_to_retry = db.get_stories_for_retry()
+        
+        if not stories_to_retry:
+            logging.debug("Aucune story à retenter")
+            return
+        
+        logging.info("🔄 %d story(ies) à retenter trouvée(s)", len(stories_to_retry))
+        
+        # Créer une instance du bot
+        bot_instance = Bot(token=TOKEN)
+        
+        for story in stories_to_retry:
+            story_id = story["id"]
+            retry_count = story.get("retry_count", 0)
+            
+            logging.info(
+                "Retry tentative %d/%d pour story %s",
+                retry_count + 1,
+                config.RETRY_MAX_ATTEMPTS,
+                story_id,
+                extra={
+                    "story_id": story_id,
+                    "retry_attempt": retry_count + 1,
+                    "max_attempts": config.RETRY_MAX_ATTEMPTS
+                }
+            )
+            
+            try:
+                # Réinitialiser le statut à PENDING pour la retry
+                db.update_story_status(
+                    story_id,
+                    "PENDING",
+                    retry_count=retry_count  # Ne pas incrémenter encore
+                )
+                
+                # Tenter la publication
+                publish_story_from_db(story, bot_instance)
+                
+                # Logger le succès du retry
+                if config.LOG_RETRY_ATTEMPTS:
+                    db.log_story_event(
+                        story_id,
+                        "RETRY_SUCCESS",
+                        {"attempt": retry_count + 1}
+                    )
+                
+            except Exception as exc:
+                logging.error(
+                    "Échec du retry pour story %s: %s",
+                    story_id,
+                    exc
+                )
+                
+                # Incrémenter retry_count et remettre en ERROR
+                new_retry_count = retry_count + 1
+                db.update_story_status(
+                    story_id,
+                    "ERROR",
+                    str(exc),
+                    retry_count=new_retry_count
+                )
+                
+                if config.LOG_RETRY_ATTEMPTS:
+                    db.log_story_event(
+                        story_id,
+                        "RETRY_FAILED",
+                        {
+                            "attempt": new_retry_count,
+                            "error": str(exc),
+                            "will_retry": new_retry_count < config.RETRY_MAX_ATTEMPTS
+                        }
+                    )
+                
+                # Notifier l'utilisateur si c'était la dernière tentative
+                if new_retry_count >= config.RETRY_MAX_ATTEMPTS:
+                    chat_id = story.get("chat_id")
+                    if chat_id:
+                        try:
+                            requests.post(
+                                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                                json={
+                                    "chat_id": chat_id,
+                                    "text": (
+                                        f"❌ *Échec définitif de publication*\n\n"
+                                        f"La story n'a pas pu être publiée après {config.RETRY_MAX_ATTEMPTS} tentatives.\n\n"
+                                        f"💬 Erreur : {exc}\n\n"
+                                        f"💡 Vérifie /status et réessaye manuellement."
+                                    ),
+                                    "parse_mode": "Markdown"
+                                },
+                                timeout=10
+                            )
+                        except Exception:
+                            pass
+                
+    except Exception as exc:
+        logging.error("Erreur dans le worker de retry: %s", exc)
+
+
+def cleanup_old_stories_job() -> None:
+    """
+    Worker qui nettoie les anciennes stories terminées.
+    Appelé toutes les 24h par APScheduler.
+    """
+    if not config.CLEANUP_ENABLED:
+        return
+def cleanup_old_stories_job() -> None:
+    """
+    Worker qui nettoie les anciennes stories terminées.
+    Appelé toutes les 24h par APScheduler.
+    """
+    if not config.CLEANUP_ENABLED:
+        return
+    
+    try:
+        logging.info("🧹 Démarrage du nettoyage automatique...")
+        
+        # Nettoyer les stories publiées
+        published_count = db.cleanup_old_stories(days=config.CLEANUP_PUBLISHED_AFTER_DAYS)
+        
+        # TODO: Nettoyer aussi les ERROR et CANCELLED séparément
+        # Pour l'instant, utiliser la fonction existante
+        
+        logging.info(
+            "✅ Nettoyage terminé: %d stories supprimées",
+            published_count,
+            extra={"deleted_count": published_count}
+        )
+        
+    except Exception as exc:
+        logging.error("Erreur lors du nettoyage automatique: %s", exc)
 
 
 # --- GESTION TELEGRAM ---
@@ -760,22 +768,47 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gestionnaire de la commande /status - Affiche l'état de la connexion."""
-    is_logged = bool(cl.user_id)
+    """Gestionnaire de la commande /status - Affiche l'état de la connexion et statistiques."""
+    is_logged = ig_manager.is_logged_in()
     session_exists = os.path.exists(SESSION_FILE)
     
-    # Récupérer les stats depuis la BDD
+    # Récupérer les stats basiques
     stats = db.get_user_stats(update.effective_chat.id)
+    
+    # Récupérer les stats avancées
+    advanced_stats = db.get_advanced_stats(update.effective_chat.id)
     
     status_icon = "✅" if is_logged else "❌"
     status_text = "Connecté" if is_logged else "Non connecté"
     
     message = f"📊 *État du bot*\n\n"
     message += f"{status_icon} Instagram : {status_text}\n"
-    message += f"💾 Session sauvegardée : {'✅ Oui' if session_exists else '❌ Non'}\n"
-    message += f"📅 Publications programmées : {stats.get('pending_count', 0)}\n"
-    message += f"✅ Publications réussies : {stats.get('published_count', 0)}\n"
-    message += f"❌ Publications échouées : {stats.get('error_count', 0)}\n\n"
+    message += f"💾 Session sauvegardée : {'✅ Oui' if session_exists else '❌ Non'}\n\n"
+    
+    message += f"📈 *Statistiques*\n"
+    message += f"📅 En attente : {stats.get('pending_count', 0)}\n"
+    message += f"✅ Publiées : {stats.get('published_count', 0)}\n"
+    message += f"❌ Erreurs : {stats.get('error_count', 0)}\n"
+    
+    if config.DRAFT_MODE_ENABLED:
+        message += f"💾 Brouillons : {stats.get('draft_count', 0)}\n"
+    
+    # Taux de succès
+    if advanced_stats.get('total', 0) > 0:
+        success_rate = advanced_stats.get('success_rate', 0)
+        message += f"\n🎯 Taux de succès : {success_rate}%\n"
+        
+        # Heures populaires
+        if advanced_stats.get('popular_times'):
+            popular = ", ".join(advanced_stats['popular_times'][:3])
+            message += f"⏰ Heures favorites : {popular}\n"
+        
+        # Préférences médias
+        prefs = advanced_stats.get('media_preferences', {})
+        if prefs:
+            message += f"📸 Photos : {prefs.get('photo', 0)} | 🎬 Vidéos : {prefs.get('video', 0)}\n"
+    
+    message += "\n"
     
     if is_logged:
         message += "🟢 Le bot est prêt à publier tes stories !"
@@ -784,7 +817,14 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         message += "La première publication déclenchera la connexion.\n"
         message += "Si le 2FA est activé, utilise /code pour entrer le code."
     
-    await update.message.reply_text(message, parse_mode="Markdown")
+    # Boutons d'action
+    keyboard = [
+        [InlineKeyboardButton("📋 Mes publications", callback_data="list_posts")],
+        [InlineKeyboardButton("📊 Stats détaillées", callback_data="detailed_stats")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(message, parse_mode="Markdown", reply_markup=reply_markup)
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -792,8 +832,6 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     Permet à l'utilisateur de transmettre le code d'authentification à deux facteurs.
     """
-    global two_factor_code
-
     if not context.args:
         await update.message.reply_text("Envoie le code 2FA ainsi: /code 123456")
         return
@@ -803,10 +841,12 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Code invalide.")
         return
 
-    two_factor_code = code
+    # Enregistrer le code 2FA pour l'utiliser lors de la connexion
+    set_pending_2fa_code(update.effective_chat.id, code)
     await update.message.reply_text("🔐 Code reçu, tentative de connexion...")
 
-    success = await asyncio.to_thread(instagram_login, update.effective_chat.id, context, True)
+    # Tenter la connexion avec le code
+    success = await ig_manager.login(update.effective_chat.id, context, force=True)
     if success:
         await update.message.reply_text("✅ Connexion Instagram validée. La publication programmée pourra se faire.")
     else:
@@ -1122,10 +1162,30 @@ if __name__ == '__main__':
     scheduler.add_job(
         check_and_publish_stories,
         'interval',
-        seconds=60,
+        seconds=config.WORKER_CHECK_INTERVAL,
         id='story_publisher_worker'
     )
-    logging.info("🔄 Worker de publication démarré (vérification toutes les 60s)")
+    logging.info("🔄 Worker de publication démarré (vérification toutes les %ds)", config.WORKER_CHECK_INTERVAL)
+    
+    # Lancer le worker de retry (toutes les 5 minutes)
+    if config.RETRY_ENABLED:
+        scheduler.add_job(
+            check_and_retry_stories,
+            'interval',
+            seconds=config.RETRY_CHECK_INTERVAL,
+            id='story_retry_worker'
+        )
+        logging.info("🔄 Worker de retry démarré (vérification toutes les %ds)", config.RETRY_CHECK_INTERVAL)
+    
+    # Lancer le worker de nettoyage (toutes les 24h)
+    if config.CLEANUP_ENABLED:
+        scheduler.add_job(
+            cleanup_old_stories_job,
+            'interval',
+            seconds=config.CLEANUP_CHECK_INTERVAL,
+            id='story_cleanup_worker'
+        )
+        logging.info("🧹 Worker de nettoyage démarré (exécution toutes les %dh)", config.CLEANUP_INTERVAL_HOURS)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -1140,4 +1200,10 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_time))
 
     print("🤖 Bot démarré ! Envoie une photo sur Telegram.")
+    print(f"✨ Features activées:")
+    print(f"   • Retry automatique: {config.RETRY_ENABLED}")
+    print(f"   • Nettoyage auto: {config.CLEANUP_ENABLED}")
+    print(f"   • Validation médias: {config.MEDIA_VALIDATION_ENABLED}")
+    print(f"   • Overlays texte: {config.TEXT_OVERLAY_ENABLED}")
+    print(f"   • Overlays musique: {config.MUSIC_OVERLAY_ENABLED}")
     app.run_polling()
