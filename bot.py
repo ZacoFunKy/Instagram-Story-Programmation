@@ -655,6 +655,38 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
+
+
+async def handle_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gestionnaire pour les fichiers audio (musique overlay)."""
+    if not config.MUSIC_OVERLAY_ENABLED:
+        await update.message.reply_text(
+            "⚠️ Les overlays musique sont désactivés."
+        )
+        return
+    
+    audio = update.message.audio
+    file_id = audio.file_id
+    file_size = audio.file_size
+    
+    # Vérifier la taille (max 50 MB pour musique)
+    if file_size and file_size > 50 * 1024 * 1024:
+        await update.message.reply_text(
+            "⚠️ Le fichier audio est trop volumineux (max 50 MB)."
+        )
+        return
+    
+    # Stocker le fichier audio
+    context.user_data['current_music_file_id'] = file_id
+    
+    await update.message.reply_text(
+        f"🎵 *Musique reçue*\n\n"
+        f"Utilise: `/music <ID_story>`\n"
+        f"pour ajouter cette musique à une story existante.",
+        parse_mode="Markdown"
+    )
+
+
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestionnaire de la commande /cancel - Annule la saisie en cours."""
     if 'current_media_file_id' in context.user_data:
@@ -674,6 +706,254 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "ℹ️ Aucune programmation en cours.\n\n"
             "Pour annuler une publication déjà programmée, utilise /list"
         )
+
+
+async def handle_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gestionnaire de la commande /draft - Sauvegarde le média comme brouillon."""
+    if not config.DRAFT_MODE_ENABLED:
+        await update.message.reply_text(
+            "⚠️ Mode brouillon désactivé.\n\n"
+            "Contacte le développeur pour activer cette fonctionnalité."
+        )
+        return
+    
+    file_id = context.user_data.get('current_media_file_id')
+    media_type = context.user_data.get('current_media_type', 'photo')
+    
+    if not file_id:
+        await update.message.reply_text(
+            "❌ *Aucun média en attente*\n\n"
+            "Envoie d'abord une photo ou vidéo, puis utilise /draft",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Créer une story en statut DRAFT sans horaire de publication
+    story = db.create_story(
+        chat_id=update.effective_chat.id,
+        file_id=file_id,
+        scheduled_time=datetime.now(ZoneInfo("UTC")) + timedelta(days=1),  # Placeholder
+        to_close_friends=context.user_data.get('to_close_friends', False),
+        media_type=media_type,
+        file_size_bytes=context.user_data.get('current_media_file_size'),
+        original_filename=context.user_data.get('current_media_filename'),
+        status='DRAFT'
+    )
+    
+    if story:
+        # Nettoyer les données temporaires
+        context.user_data.pop('current_media_file_id', None)
+        context.user_data.pop('current_media_type', None)
+        context.user_data.pop('current_media_file_size', None)
+        context.user_data.pop('current_media_filename', None)
+        context.user_data.pop('to_close_friends', None)
+        
+        await update.message.reply_text(
+            f"💾 *Brouillon sauvegardé*\n\n"
+            f"📝 ID: {story['id']}\n"
+            f"📸 Type: {'Vidéo' if media_type == 'video' else 'Photo'}\n\n"
+            f"Utilise `/edit {story['id']}` pour modifier ou programmer.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Erreur lors de la sauvegarde du brouillon."
+        )
+
+
+async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gestionnaire de la commande /edit - Modifie une story programmée ou brouillon."""
+    if not context.args:
+        # Lister les stories modifiables
+        user_stories = db.get_user_stories(update.effective_chat.id)
+        draft_stories = [s for s in user_stories if s.get('status') == 'DRAFT']
+        pending_stories = [s for s in user_stories if s.get('status') == 'PENDING']
+        
+        if not draft_stories and not pending_stories:
+            await update.message.reply_text(
+                "ℹ️ Aucune story à éditer.\n\n"
+                "Utilise: `/edit <ID_story>`",
+                parse_mode="Markdown"
+            )
+            return
+        
+        message = "📝 *Stories modifiables*\n\n"
+        
+        if draft_stories:
+            message += "*Brouillons:*\n"
+            for story in draft_stories[:5]:
+                message += f"  • {story['id']}\n"
+            message += "\n"
+        
+        if pending_stories:
+            message += "*Programmées:*\n"
+            for story in pending_stories[:5]:
+                scheduled = datetime.fromisoformat(story['scheduled_time'].replace('Z', '+00:00'))
+                message += f"  • {story['id']} ({scheduled.strftime('%H:%M')})\n"
+        
+        message += "\nUtilise: `/edit <ID>`"
+        await update.message.reply_text(message, parse_mode="Markdown")
+        return
+    
+    story_id = context.args[0]
+    story = db.get_story_by_id(story_id)
+    
+    if not story or story['chat_id'] != update.effective_chat.id:
+        await update.message.reply_text(
+            "❌ Story non trouvée ou accès refusé."
+        )
+        return
+    
+    if story['status'] not in ['DRAFT', 'PENDING']:
+        await update.message.reply_text(
+            f"⚠️ Cette story ne peut pas être éditée (statut: {story['status']})."
+        )
+        return
+    
+    context.user_data['edit_story_id'] = story_id
+    
+    scheduled_time = datetime.fromisoformat(story['scheduled_time'].replace('Z', '+00:00'))
+    scheduled_local = scheduled_time.astimezone(TIMEZONE)
+    
+    keyboard = [
+        [InlineKeyboardButton("⏰ Modifier l'horaire", callback_data=f"edit_time_{story_id}")],
+        [InlineKeyboardButton("✍️ Ajouter texte", callback_data=f"edit_text_{story_id}")],
+        [InlineKeyboardButton("🎵 Ajouter musique", callback_data=f"edit_music_{story_id}")],
+        [InlineKeyboardButton("👥 Amis proches", callback_data=f"edit_close_friends_{story_id}")],
+        [InlineKeyboardButton("✅ Valider", callback_data=f"edit_confirm_{story_id}")],
+        [InlineKeyboardButton("❌ Annuler", callback_data="edit_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = f"📝 *Édition de story*\n\n"
+    message += f"🕐 Programmé: {scheduled_local.strftime('%d/%m %H:%M')}\n"
+    message += f"📸 Type: {'Vidéo' if story['media_type'] == 'video' else 'Photo'}\n"
+    message += f"👥 Amis proches: {'✅' if story.get('to_close_friends') else '❌'}\n"
+    
+    if story.get('text_overlay'):
+        message += f"✍️ Texte: {story['text_overlay']}\n"
+    
+    if story.get('music_file_id'):
+        message += f"🎵 Musique: ✅\n"
+    
+    message += "\n*Que veux-tu modifier ?*"
+    
+    await update.message.reply_text(message, parse_mode="Markdown", reply_markup=reply_markup)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gestionnaire de la commande /text - Ajoute du texte overlay."""
+    if not config.TEXT_OVERLAY_ENABLED:
+        await update.message.reply_text(
+            "⚠️ Les overlays texte sont désactivés."
+        )
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "✍️ *Ajouter du texte*\n\n"
+            "Utilise: `/text <ID_story> <texte>`\n\n"
+            "Exemples:\n"
+            "`/text 123abc456 Salut les amis !`\n"
+            "`/text 789def012 Mon nouveau produit`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Format incorrect.\n\n"
+            "Utilise: `/text <ID> <texte>`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    story_id = context.args[0]
+    text_content = " ".join(context.args[1:])
+    
+    # Vérifier la longueur du texte
+    if len(text_content) > 200:
+        await update.message.reply_text(
+            "⚠️ Le texte est trop long (max 200 caractères).\n"
+            f"Ton texte: {len(text_content)} caractères"
+        )
+        return
+    
+    story = db.get_story_by_id(story_id)
+    if not story or story['chat_id'] != update.effective_chat.id:
+        await update.message.reply_text("❌ Story non trouvée.")
+        return
+    
+    # Mettre à jour la story avec le texte
+    db.update_story(
+        story_id,
+        text_overlay=text_content,
+        text_position='center',
+        text_color='#FFFFFF'
+    )
+    
+    await update.message.reply_text(
+        f"✍️ *Texte ajouté*\n\n"
+        f"📝 Texte: {text_content}\n"
+        f"📍 Position: Centre\n"
+        f"🎨 Couleur: Blanc\n\n"
+        f"La story sera publiée avec ce texte.",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gestionnaire de la commande /music - Ajoute une musique overlay."""
+    if not config.MUSIC_OVERLAY_ENABLED:
+        await update.message.reply_text(
+            "⚠️ Les overlays musique sont désactivés."
+        )
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "🎵 *Ajouter de la musique*\n\n"
+            "1️⃣ Envoie un fichier audio (MP3, M4A, etc.)\n"
+            "2️⃣ Réponds avec: `/music <ID_story>`\n\n"
+            "Exemple:\n"
+            "`/music 123abc456`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    story_id = context.args[0]
+    music_file_id = context.user_data.get('current_music_file_id')
+    
+    if not music_file_id:
+        await update.message.reply_text(
+            "❌ Aucun fichier audio en attente.\n\n"
+            "Envoie d'abord un fichier audio, puis utilise `/music <ID>`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    story = db.get_story_by_id(story_id)
+    if not story or story['chat_id'] != update.effective_chat.id:
+        await update.message.reply_text("❌ Story non trouvée.")
+        return
+    
+    # Mettre à jour la story avec la musique
+    db.update_story(
+        story_id,
+        music_file_id=music_file_id,
+        music_volume=0.5  # Volume par défaut à 50%
+    )
+    
+    context.user_data.pop('current_music_file_id', None)
+    
+    await update.message.reply_text(
+        f"🎵 *Musique ajoutée*\n\n"
+        f"🔊 Volume: 50%\n"
+        f"🎵 Musique: ✅\n\n"
+        f"La story sera publiée avec cette musique.",
+        parse_mode="Markdown"
+    )
+
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1109,7 +1389,12 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "2. Choisis l'audience (tout le monde / amis proches)\n"
         "3. Utilise les boutons rapides ou envoie une date/heure\n\n"
         f"{datetime_help}\n\n"
-        "*🔐 Authentification 2FA :*\n"
+        "*� Édition et overlays :*\n"
+        "/draft - Sauvegarder une story comme brouillon\n"
+        "/edit `<ID>` - Modifier une story programmée\n"
+        "/text `<ID>` `<texte>` - Ajouter du texte overlay\n"
+        "/music `<ID>` - Ajouter une musique overlay (après avoir envoyé l'audio)\n\n"
+        "*�🔐 Authentification 2FA :*\n"
         "Si Instagram demande un code :\n"
         "1. Ouvre ton app **Google Authenticator**\n"
         "2. Copie le code à 6 chiffres\n"
@@ -1193,10 +1478,15 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("list", handle_list))
     app.add_handler(CommandHandler("cancel", handle_cancel))
+    app.add_handler(CommandHandler("draft", handle_draft))
+    app.add_handler(CommandHandler("edit", handle_edit))
+    app.add_handler(CommandHandler("text", handle_text))
+    app.add_handler(CommandHandler("music", handle_music))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("code", handle_code))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.IMAGE | filters.Document.VIDEO, handle_media))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio_file))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_time))
 
     print("🤖 Bot démarré ! Envoie une photo sur Telegram.")
